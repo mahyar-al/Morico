@@ -197,6 +197,8 @@ export type OrderStatus =
   | 'PENDING_PAYMENT'
   | 'PAYMENT_FAILED'
   | 'CANCELED'
+  | 'CANCELLED'
+  | 'RETURNED'
   | 'REFUNDED'
   | 'pending'
   | 'processing'
@@ -204,12 +206,54 @@ export type OrderStatus =
   | 'delivered'
   | 'cancelled';
 
+export type PaymentAttemptStatus =
+  | 'INITIATED'
+  | 'PENDING'
+  | 'SUCCESS'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'EXPIRED'
+  | 'AMBIGUOUS';
+
+export interface PaymentAttempt {
+  id: string;
+  authority?: string;
+  amountToman: number;
+  amountRials: number;
+  currency: 'IRR' | 'IRT';
+  mode: 'sandbox' | 'production';
+  gateway: string;
+  status: PaymentAttemptStatus;
+  refId?: string;
+  cardPanMask?: string;
+  cardHash?: string;
+  feeType?: string;
+  fee?: number;
+  verifyCode?: number;
+  errorCode?: number | string;
+  errorMessage?: string;
+  idempotencyKey?: string;
+  createdAt: string;
+  updatedAt: string;
+  verifiedAt?: string;
+}
+
 export interface OrderPaymentInfo {
   gateway?: string;
+  authority?: string;
+  attemptId?: string;
+  mode?: 'sandbox' | 'production';
   refId?: string;
+  cardPanMask?: string;
   cardPan?: string;
+  cardHash?: string;
+  feeType?: string;
+  fee?: number;
   paidAt?: string;
-  [key: string]: any;
+  verifiedAt?: string;
+  createdAt?: string;
+  lastError?: string;
+  [key: string]: unknown;
 }
 
 export interface Order {
@@ -237,10 +281,16 @@ export interface Order {
   shippingFee?: number;
   shipping?: number;
   status: OrderStatus;
-  paymentStatus?: string;
+  paymentStatus?: PaymentAttemptStatus | 'PAID' | 'PENDING' | 'FAILED' | 'CANCELLED' | 'PENDING_VERIFY' | string;
   paymentInfo?: OrderPaymentInfo;
+  paymentAttempts?: PaymentAttempt[];
+  inventoryDeducted?: boolean;
+  inventoryDeductedAt?: string;
+  paidAt?: string;
   trackingCode: string;
   paymentMethod?: string;
+  idempotencyKey?: string;
+  paymentToken?: string;
   customization?: CustomizationData;
 }
 
@@ -306,9 +356,34 @@ export interface User {
 export interface PaymentGatewayStatus {
   gatewayName: string;
   configured: boolean;
+  ready?: boolean;
   mode: 'sandbox' | 'production';
   merchantId?: string;
+  hasMerchantId?: boolean;
+  merchantIdMasked?: string;
+  envManaged?: boolean;
+  callbackUrl?: string;
   disabledReason?: string;
+}
+
+export interface PaymentRequestResponse {
+  success: boolean;
+  authority: string;
+  paymentUrl: string;
+  attemptId: string;
+  orderNumber: string;
+  mode: 'sandbox' | 'production';
+  idempotent?: boolean;
+}
+
+export interface PaymentVerifyResponse {
+  success: boolean;
+  code: number;
+  message: string;
+  refId?: string;
+  cardPanMask?: string;
+  ambiguous?: boolean;
+  order?: Order;
 }
 
 export interface FaqItem {

@@ -6,6 +6,7 @@ import crypto from 'crypto';
 import dotenv from 'dotenv';
 import cookieParser from 'cookie-parser';
 import sharp from 'sharp';
+import { SignJWT, jwtVerify } from 'jose';
 
 import {
   validatePasswordPolicy,
@@ -62,13 +63,20 @@ import { isRedisConnected } from './src/server/redisStore';
 import {
   isValidOrderStatus,
   isValidOrderStatusTransition,
+  isCancelledOrderStatus,
+  isPaidOrFulfilledOrderStatus,
   sanitizeOrderInput,
   OrderStatus
 } from './src/server/schema';
 
 import {
+  requestZarinPalPayment,
   verifyZarinPalTransaction,
-  ZarinPalVerifyResult
+  isValidMerchantId,
+  maskMerchantId,
+  tomanToRial,
+  ZarinPalVerifyResult,
+  ZarinPalMode
 } from './src/server/payment';
 
 dotenv.config();
@@ -341,10 +349,14 @@ const DEFAULT_SITE_CONTENT = {
   publishedAt: new Date().toISOString()
 };
 
+const ENV_ZARINPAL_MERCHANT = (process.env.ZARINPAL_MERCHANT_ID || '').trim();
+const ENV_ZARINPAL_MODE: ZarinPalMode =
+  (process.env.ZARINPAL_MODE || '').trim().toLowerCase() === 'production' ? 'production' : 'sandbox';
+
 const DEFAULT_GATEWAY = {
   gatewayName: 'زرین‌پال (ZarinPal IPG)',
-  configured: false,
-  mode: 'sandbox',
+  configured: isValidMerchantId(ENV_ZARINPAL_MERCHANT),
+  mode: ENV_ZARINPAL_MODE,
   merchantId: '',
   disabledReason: 'درگاه پرداخت اینترنتی هنوز متصل نشده است و در انتظار فعال‌سازی توسط مدیریت فروشگاه می‌باشد.'
 };
@@ -428,6 +440,276 @@ export function loadPersistentState() {
 }
 
 loadPersistentState();
+
+// ============================================================================
+// PAYMENT GATEWAY CONFIGURATION, LOCKING & ORDER TOKEN HELPERS
+// ============================================================================
+const orderOperationLocks = new Map<string, Promise<void>>();
+
+async function withOrderLock<T>(orderId: string, fn: () => Promise<T>): Promise<T> {
+  const prev = orderOperationLocks.get(orderId) || Promise.resolve();
+  let release!: () => void;
+  const current = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  const chained = prev.then(() => current);
+  orderOperationLocks.set(orderId, chained);
+  await prev;
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (orderOperationLocks.get(orderId) === chained) {
+      orderOperationLocks.delete(orderId);
+    }
+  }
+}
+
+export function getEffectiveGatewayConfig() {
+  const envMerchant = (process.env.ZARINPAL_MERCHANT_ID || '').trim();
+  const envModeRaw = (process.env.ZARINPAL_MODE || '').trim().toLowerCase();
+  const envMode: ZarinPalMode | undefined =
+    envModeRaw === 'production' ? 'production' : envModeRaw === 'sandbox' ? 'sandbox' : undefined;
+  const envCallbackUrl = (process.env.ZARINPAL_CALLBACK_URL || '').trim();
+
+  const effectiveMerchantId = envMerchant || String(dbGatewayStatus.merchantId || '').trim();
+  const mode: ZarinPalMode = envMode || (dbGatewayStatus.mode === 'production' ? 'production' : 'sandbox');
+  const hasMerchantId = isValidMerchantId(effectiveMerchantId);
+  const configured = Boolean(dbGatewayStatus.configured);
+  const ready = configured && hasMerchantId;
+
+  let disabledReason =
+    dbGatewayStatus.disabledReason ||
+    'درگاه پرداخت اینترنتی هنوز متصل نشده است و در انتظار فعال‌سازی توسط مدیریت فروشگاه می‌باشد.';
+  if (configured && !hasMerchantId) {
+    disabledReason = 'کد مرچنت (Merchant ID) درگاه زرین‌پال تنظیم نشده یا قالب معتبری ندارد.';
+  }
+
+  return {
+    gatewayName: dbGatewayStatus.gatewayName || 'زرین‌پال (ZarinPal IPG)',
+    configured,
+    ready,
+    mode,
+    merchantId: effectiveMerchantId,
+    hasMerchantId,
+    merchantIdMasked: hasMerchantId ? maskMerchantId(effectiveMerchantId) : '',
+    envManaged: Boolean(envMerchant),
+    callbackUrl: envCallbackUrl || undefined,
+    disabledReason
+  };
+}
+
+function getCallbackUrl(req: Request): string {
+  const explicit = (process.env.ZARINPAL_CALLBACK_URL || '').trim();
+  if (explicit && /^https?:\/\//i.test(explicit)) {
+    return explicit;
+  }
+  const appBase = (process.env.APP_BASE_URL || '').trim().replace(/\/+$/, '');
+  if (appBase && /^https?:\/\//i.test(appBase)) {
+    return `${appBase}/api/payments/zarinpal/callback`;
+  }
+  const forwardedProto =
+    typeof req.headers['x-forwarded-proto'] === 'string'
+      ? req.headers['x-forwarded-proto'].split(',')[0].trim()
+      : '';
+  const protocol = forwardedProto || req.protocol || 'http';
+  const forwardedHost =
+    typeof req.headers['x-forwarded-host'] === 'string'
+      ? req.headers['x-forwarded-host'].split(',')[0].trim()
+      : '';
+  const host = forwardedHost || req.get('host') || `localhost:${PORT}`;
+  return `${protocol}://${host}/api/payments/zarinpal/callback`;
+}
+
+function getOrderPaymentJwtKey(): Uint8Array {
+  return crypto.createHash('sha256').update(`${SESSION_SECRET!}:order_payment`).digest();
+}
+
+async function signOrderPaymentToken(order: any): Promise<string> {
+  const phoneSuffix = cleanPhoneNumber(order.customerPhone || '').slice(-10);
+  return await new SignJWT({
+    purpose: 'order_payment',
+    orderId: order.id,
+    orderNumber: order.orderNumber,
+    phoneSuffix
+  })
+    .setProtectedHeader({ alg: 'HS256' })
+    .setIssuedAt()
+    .setExpirationTime('4h')
+    .sign(getOrderPaymentJwtKey());
+}
+
+async function verifyOrderPaymentToken(
+  token: string,
+  order: any
+): Promise<boolean> {
+  try {
+    const { payload } = await jwtVerify(token, getOrderPaymentJwtKey(), {
+      algorithms: ['HS256']
+    });
+    if (payload.purpose !== 'order_payment') return false;
+    return payload.orderId === order.id && payload.orderNumber === order.orderNumber;
+  } catch {
+    return false;
+  }
+}
+
+async function isAuthorizedForOrderPayment(req: Request, order: any): Promise<boolean> {
+  // 1. Dedicated payment token from header, body, cookie, or query
+  const candidateTokens = [
+    req.headers['x-payment-token'],
+    req.body?.paymentToken,
+    req.cookies?.morico_pay_order,
+    req.query?.paymentToken
+  ].filter((t): t is string => typeof t === 'string' && t.trim().length > 10);
+
+  for (const tok of candidateTokens) {
+    if (await verifyOrderPaymentToken(tok.trim(), order)) {
+      return true;
+    }
+  }
+
+  // 2. Customer or Admin session JWT
+  const sessionToken = extractBearerOrCookieToken(req);
+  if (sessionToken) {
+    const userPayload = await verifyJoseToken(
+      sessionToken,
+      SESSION_SECRET!,
+      (id) => dbUsers.find((u) => u.id === id),
+      (jti, tok) => isTokenRevoked(jti, tok)
+    );
+    if (userPayload) {
+      if (userPayload.role === 'admin') return true;
+      const userObj = dbUsers.find((u) => u.id === userPayload.userId);
+      const userPhone = cleanPhoneNumber(userObj?.phone || '').slice(-10);
+      const orderPhone = cleanPhoneNumber(order.customerPhone || '').slice(-10);
+      if (userPhone && orderPhone && userPhone === orderPhone) {
+        return true;
+      }
+    }
+  }
+
+  // 3. Matching customer phone (last 10 digits) provided explicitly
+  const providedPhone = cleanPhoneNumber(String(req.body?.phone || req.query?.phone || '')).slice(-10);
+  const orderPhoneSuffix = cleanPhoneNumber(order.customerPhone || '').slice(-10);
+  if (providedPhone.length === 10 && orderPhoneSuffix.length === 10 && providedPhone === orderPhoneSuffix) {
+    return true;
+  }
+
+  return false;
+}
+
+function checkOrderItemsStock(order: any): { ok: true } | { ok: false; error: string } {
+  for (const it of order.items || []) {
+    const pid = it.productId || it.product?.id;
+    const qty = Math.max(1, Number(it.quantity) || 1);
+    const prod = dbProducts.find((p) => p.id === pid && p.status !== 'archived');
+    if (!prod) {
+      return { ok: false, error: `محصول «${it.product?.name || pid}» در فروشگاه موجود نیست.` };
+    }
+    if (it.selectedVariantId && Array.isArray(prod.variants)) {
+      const variant = prod.variants.find((v: any) => v.id === it.selectedVariantId);
+      if (!variant || (typeof variant.stock === 'number' && variant.stock < qty)) {
+        return {
+          ok: false,
+          error: `موجودی تنوع انتخابی محصول «${prod.name}» در انبار کافی نیست.`
+        };
+      }
+    } else if (typeof prod.stock === 'number' && prod.stock < qty) {
+      return {
+        ok: false,
+        error: `موجودی محصول «${prod.name}» در انبار کافی نیست (موجودی فعلی: ${prod.stock} عدد).`
+      };
+    }
+  }
+  return { ok: true };
+}
+
+function decrementOrderInventoryOnce(order: any, actorIp = '127.0.0.1'): boolean {
+  if (order.inventoryDeducted) return false;
+  for (const it of order.items || []) {
+    const pid = it.productId || it.product?.id;
+    const qty = Math.max(1, Number(it.quantity) || 1);
+    const prod = dbProducts.find((p) => p.id === pid);
+    if (!prod) continue;
+    if (it.selectedVariantId && Array.isArray(prod.variants)) {
+      const variant = prod.variants.find((v: any) => v.id === it.selectedVariantId);
+      if (variant && typeof variant.stock === 'number') {
+        variant.stock = Math.max(0, variant.stock - qty);
+      }
+    }
+    if (typeof prod.stock === 'number') {
+      prod.stock = Math.max(0, prod.stock - qty);
+    }
+  }
+  order.inventoryDeducted = true;
+  order.inventoryDeductedAt = new Date().toISOString();
+  recordAuditLog({
+    event: 'INVENTORY_DECREMENTED',
+    ip: actorIp,
+    details: `موجودی انبار برای سفارش ${order.orderNumber} پس از تایید قطعی پرداخت کسر گردید.`,
+    severity: 'info'
+  });
+  return true;
+}
+
+function restoreOrderInventoryOnce(order: any): boolean {
+  if (!order.inventoryDeducted) return false;
+  for (const it of order.items || []) {
+    const pid = it.productId || it.product?.id;
+    const qty = Math.max(1, Number(it.quantity) || 1);
+    const prod = dbProducts.find((p) => p.id === pid);
+    if (!prod) continue;
+    if (it.selectedVariantId && Array.isArray(prod.variants)) {
+      const variant = prod.variants.find((v: any) => v.id === it.selectedVariantId);
+      if (variant && typeof variant.stock === 'number') {
+        variant.stock = variant.stock + qty;
+      }
+    }
+    if (typeof prod.stock === 'number') {
+      prod.stock = prod.stock + qty;
+    }
+  }
+  order.inventoryDeducted = false;
+  return true;
+}
+
+function sanitizeOrderPaymentResult(order: any) {
+  return {
+    id: order.id,
+    orderNumber: order.orderNumber,
+    date: order.date,
+    status: order.status,
+    paymentStatus: order.paymentStatus,
+    paymentMethod: order.paymentMethod,
+    trackingCode: order.trackingCode,
+    customerName: order.customerName,
+    customerPhone: order.customerPhone,
+    customerAddress: order.customerAddress,
+    province: order.province,
+    city: order.city,
+    postalCode: order.postalCode,
+    items: order.items,
+    subtotal: order.subtotal,
+    discountAmount: order.discountAmount ?? order.discount ?? 0,
+    promoCode: order.promoCode,
+    shippingFee: order.shippingFee ?? order.shipping ?? 0,
+    totalAmount: order.totalAmount ?? order.total ?? 0,
+    paidAt: order.paidAt || order.paymentInfo?.paidAt,
+    paymentInfo: order.paymentInfo
+      ? {
+          gateway: order.paymentInfo.gateway,
+          authority: order.paymentInfo.authority,
+          mode: order.paymentInfo.mode,
+          refId: order.paymentInfo.refId,
+          cardPanMask: order.paymentInfo.cardPanMask,
+          paidAt: order.paymentInfo.paidAt,
+          verifiedAt: order.paymentInfo.verifiedAt,
+          lastError: order.paymentInfo.lastError
+        }
+      : undefined
+  };
+}
 
 // ============================================================================
 // AUTHENTICATION & ACCESS CONTROL HELPERS (OWASP ASVS V3, V4)
@@ -564,7 +846,7 @@ app.use((req, res, next) => {
 
   const scriptDirective = isProduction
     ? `'self' 'nonce-${nonce}' 'strict-dynamic'`
-    : `'self' 'nonce-${nonce}' 'unsafe-inline' 'unsafe-eval'`;
+    : `'self' 'unsafe-inline' 'unsafe-eval'`;
 
   const frameAncestorsDirective = req.path.startsWith('/api') ? "frame-ancestors 'none'; " : "";
 
@@ -576,7 +858,7 @@ app.use((req, res, next) => {
     "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; " +
     "font-src 'self' data: https://fonts.gstatic.com; " +
     "img-src 'self' data: blob: https://images.unsplash.com https://*.tile.openstreetmap.org https://trustseal.enamad.ir; " +
-    "connect-src 'self' https://nominatim.openstreetmap.org https://api.zarinpal.com; " +
+    "connect-src 'self' https://nominatim.openstreetmap.org https://api.zarinpal.com https://payment.zarinpal.com https://sandbox.zarinpal.com; " +
     frameAncestorsDirective +
     "object-src 'none'; " +
     "base-uri 'self'; " +
@@ -599,7 +881,7 @@ app.use((req, res, next) => {
       res.setHeader('Access-Control-Allow-Origin', origin);
       res.setHeader('Access-Control-Allow-Credentials', 'true');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Payment-Token');
     }
   }
 
@@ -1327,11 +1609,13 @@ app.get('/api/content', (req, res) => {
 
 // Payment status: Hides merchantId from public clients (OWASP ASVS V13.2)
 app.get('/api/payments/status', (req, res) => {
+  const effective = getEffectiveGatewayConfig();
   res.json({
-    gatewayName: dbGatewayStatus.gatewayName || 'زرین‌پال (ZarinPal IPG)',
-    configured: Boolean(dbGatewayStatus.configured),
-    mode: dbGatewayStatus.mode || 'sandbox',
-    disabledReason: dbGatewayStatus.disabledReason || ''
+    gatewayName: effective.gatewayName,
+    configured: effective.ready,
+    ready: effective.ready,
+    mode: effective.mode,
+    disabledReason: effective.disabledReason
   });
 });
 
@@ -1423,23 +1707,48 @@ app.get('/api/reverse-geocode', async (req, res) => {
 // ============================================================================
 // 3. ORDER PLACEMENT & TAMPERING DEFENSE (OWASP ASVS V10.2, V10.3, V13.2)
 // ============================================================================
-app.post('/api/orders', (req, res) => {
+app.post('/api/orders', async (req, res) => {
   const sanitized = sanitizeOrderInput(req.body);
   if ('error' in sanitized) {
     return res.status(400).json({ error: sanitized.error });
   }
 
   const isGatewayPayment = sanitized.paymentMethod === 'gateway';
-  if (isGatewayPayment && !dbGatewayStatus.configured) {
+  const effectiveGateway = getEffectiveGatewayConfig();
+  if (isGatewayPayment && !effectiveGateway.ready) {
     return res.status(400).json({
-      error: 'درگاه پرداخت اینترنتی هنوز متصل نشده است. تا زمان اتصال درگاه توسط مدیریت فروشگاه، امکان پرداخت آنلاین وجود ندارد.'
+      error:
+        effectiveGateway.disabledReason ||
+        'درگاه پرداخت اینترنتی هنوز متصل نشده است. تا زمان اتصال درگاه توسط مدیریت فروشگاه، امکان پرداخت آنلاین وجود ندارد.'
     });
+  }
+
+  // Idempotent order creation if client retries with same idempotencyKey + phone
+  if (sanitized.idempotencyKey) {
+    const phoneSuffix = sanitized.customerPhone.slice(-10);
+    const existingPending = dbOrders.find(
+      (o) =>
+        o.idempotencyKey === sanitized.idempotencyKey &&
+        cleanPhoneNumber(o.customerPhone).slice(-10) === phoneSuffix &&
+        (o.status === 'PENDING_PAYMENT' || o.status === 'PAYMENT_FAILED')
+    );
+    if (existingPending) {
+      const paymentToken = await signOrderPaymentToken(existingPending);
+      res.cookie('morico_pay_order', paymentToken, {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: 'lax',
+        path: '/',
+        maxAge: 4 * 60 * 60 * 1000
+      });
+      return res.status(200).json({ ...existingPending, paymentToken });
+    }
   }
 
   let calculatedSubtotal = 0;
   const verifiedItems: any[] = [];
 
-  // Strict Product Existence, Stock Check, and Server-Side Price Verification
+  // Strict Product Existence, Variant Resolution, Stock Check, and Server-Side Price Verification
   for (const item of sanitized.items) {
     const foundProduct = dbProducts.find((p) => p.id === item.productId && p.status !== 'archived');
     if (!foundProduct) {
@@ -1448,22 +1757,40 @@ app.post('/api/orders', (req, res) => {
       });
     }
 
-    // Inventory Stock Check
-    if (typeof foundProduct.stock === 'number' && foundProduct.stock < item.quantity) {
+    let selectedVariant: any = undefined;
+    if (item.selectedVariantId && Array.isArray(foundProduct.variants)) {
+      selectedVariant = foundProduct.variants.find((v: any) => v.id === item.selectedVariantId);
+      if (!selectedVariant) {
+        return res.status(400).json({
+          error: `تنوع انتخاب‌شده برای محصول «${foundProduct.name}» در سیستم یافت نشد.`
+        });
+      }
+    }
+
+    // Inventory Stock Check (never decrements stock on order creation!)
+    const availableStock =
+      selectedVariant && typeof selectedVariant.stock === 'number'
+        ? selectedVariant.stock
+        : foundProduct.stock;
+
+    if (typeof availableStock === 'number' && availableStock < item.quantity) {
       return res.status(400).json({
-        error: `موجودی محصول «${foundProduct.name || item.productId}» در انبار کافی نیست (موجودی فعلی: ${foundProduct.stock} عدد).`
+        error: `موجودی محصول «${foundProduct.name || item.productId}» در انبار کافی نیست (موجودی فعلی: ${availableStock} عدد).`
       });
     }
 
     // Price is strictly read from database only
-    const unitPrice =
-      foundProduct.discountPrice && foundProduct.discountPrice > 0 && foundProduct.discountPrice < foundProduct.price
-        ? foundProduct.discountPrice
-        : foundProduct.price;
+    const basePrice = selectedVariant ? Number(selectedVariant.price) : Number(foundProduct.price);
+    const discPrice = selectedVariant
+      ? Number(selectedVariant.discountPrice || 0)
+      : Number(foundProduct.discountPrice || 0);
+
+    const unitPrice = discPrice > 0 && discPrice < basePrice ? discPrice : basePrice;
 
     // Customization fee validation
     let customFee = 0;
-    if (foundProduct.allowCustomization && item.customization?.customFee) {
+    const isCustomizable = Boolean(foundProduct.customizable || foundProduct.allowCustomization);
+    if (isCustomizable && item.customization?.customFee) {
       const rawFee = Number(item.customization.customFee);
       if (rawFee > 0 && rawFee <= 500000) {
         customFee = rawFee;
@@ -1473,13 +1800,27 @@ app.post('/api/orders', (req, res) => {
     const itemTotal = (unitPrice + customFee) * item.quantity;
     calculatedSubtotal += itemTotal;
 
+    const productImage = foundProduct.image || foundProduct.imageUrl || foundProduct.images?.[0] || '';
+
     verifiedItems.push({
       productId: foundProduct.id,
+      selectedVariantId: selectedVariant?.id,
+      selectedVariant: selectedVariant
+        ? {
+            id: selectedVariant.id,
+            title: selectedVariant.title,
+            price: selectedVariant.price,
+            discountPrice: selectedVariant.discountPrice,
+            stock: selectedVariant.stock,
+            attributes: selectedVariant.attributes || {}
+          }
+        : undefined,
       product: {
         id: foundProduct.id,
         name: foundProduct.name,
         price: unitPrice,
-        imageUrl: foundProduct.imageUrl || foundProduct.images?.[0]
+        image: productImage,
+        imageUrl: productImage
       },
       quantity: item.quantity,
       selectedColor: item.selectedColor,
@@ -1491,7 +1832,7 @@ app.post('/api/orders', (req, res) => {
     });
   }
 
-  // Server-side Discount Promo Evaluation
+  // Server-side Discount Promo Evaluation (aligned with cartUtils.ts)
   let calculatedDiscount = 0;
   let promoCodeApplied = '';
 
@@ -1499,26 +1840,38 @@ app.post('/api/orders', (req, res) => {
     const codeStr = sanitized.promoCode.trim().toUpperCase();
     const foundDiscount = dbDiscounts.find((d) => d.code === codeStr && d.active !== false);
     if (foundDiscount) {
-      if (!foundDiscount.minOrderAmount || calculatedSubtotal >= foundDiscount.minOrderAmount) {
-        if (foundDiscount.type === 'percentage') {
-          calculatedDiscount = Math.round((calculatedSubtotal * foundDiscount.amount) / 100);
+      const expiry = foundDiscount.expiresAt || foundDiscount.expiryDate;
+      const isExpired = expiry ? new Date(expiry).getTime() < Date.now() : false;
+      const maxUses = foundDiscount.maxUses ?? foundDiscount.usageLimit;
+      const usedCount = foundDiscount.usedCount ?? foundDiscount.usageCount ?? 0;
+      const isExhausted = maxUses !== undefined && maxUses > 0 && usedCount >= maxUses;
+
+      if (!isExpired && !isExhausted && (!foundDiscount.minOrderAmount || calculatedSubtotal >= foundDiscount.minOrderAmount)) {
+        const isPercentage =
+          foundDiscount.type === 'percentage' || (foundDiscount.percent && !foundDiscount.amount);
+        const rate = Number(foundDiscount.amount ?? foundDiscount.percent ?? 0);
+
+        if (isPercentage) {
+          calculatedDiscount = Math.round((calculatedSubtotal * rate) / 100);
           if (foundDiscount.maxDiscountAmount && calculatedDiscount > foundDiscount.maxDiscountAmount) {
             calculatedDiscount = foundDiscount.maxDiscountAmount;
           }
         } else {
-          calculatedDiscount = Math.min(foundDiscount.amount, calculatedSubtotal);
+          calculatedDiscount = Math.min(rate, calculatedSubtotal);
         }
+        calculatedDiscount = Math.min(calculatedDiscount, calculatedSubtotal);
         promoCodeApplied = foundDiscount.code;
-        foundDiscount.usedCount = (foundDiscount.usedCount || 0) + 1;
+        foundDiscount.usedCount = usedCount + 1;
       }
     }
   }
 
-  // Shipping calculation
-  const SHIPPING_FREE_THRESHOLD = 500000;
+  // Shipping calculation (aligned with src/lib/cartUtils.ts: threshold 1,500,000 Tomans on payableSubtotal)
+  const SHIPPING_FREE_THRESHOLD = 1500000;
   const STANDARD_SHIPPING_FEE = 45000;
-  const calculatedShipping = calculatedSubtotal >= SHIPPING_FREE_THRESHOLD ? 0 : STANDARD_SHIPPING_FEE;
-  const serverVerifiedTotal = Math.max(0, calculatedSubtotal - calculatedDiscount + calculatedShipping);
+  const payableSubtotal = Math.max(0, calculatedSubtotal - calculatedDiscount);
+  const calculatedShipping = payableSubtotal >= SHIPPING_FREE_THRESHOLD ? 0 : STANDARD_SHIPPING_FEE;
+  const serverVerifiedTotal = Math.max(0, payableSubtotal + calculatedShipping);
 
   // Price Tampering Defense: Detect and reject client modifications
   const clientSuppliedTotal = Number(req.body.totalAmount ?? req.body.total);
@@ -1539,8 +1892,8 @@ app.post('/api/orders', (req, res) => {
   const orderNumber = `MC-${randomOrderSuffix}`;
   const trackingCode = `TRK-${crypto.randomBytes(6).toString('hex').toUpperCase()}`;
 
-  // Initial order status is ALWAYS PENDING_PAYMENT (Payment Verification Rule)
-  const newOrder = {
+  // Initial order status is ALWAYS PENDING_PAYMENT; no fake authority, no fake refId, no stock decrement yet
+  const newOrder: any = {
     id: `ord-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
     orderNumber,
     date: new Date().toISOString(),
@@ -1562,18 +1915,35 @@ app.post('/api/orders', (req, res) => {
     total: serverVerifiedTotal,
     totalAmount: serverVerifiedTotal,
     status: 'PENDING_PAYMENT' as OrderStatus,
-    paymentStatus: 'PENDING',
+    paymentStatus: isGatewayPayment ? 'INITIATED' : 'PENDING',
     paymentMethod: isGatewayPayment ? 'درگاه پرداخت شاپرک / زرین‌پال' : 'کارت به کارت / حساب رسمی آتلیه',
-    paymentInfo: {
-      gateway: dbGatewayStatus.gatewayName || 'زرین‌پال (ZarinPal IPG)',
-      authority: `AUTH_${crypto.randomBytes(8).toString('hex').toUpperCase()}`,
-      createdAt: new Date().toISOString()
-    },
+    paymentInfo: isGatewayPayment
+      ? {
+          gateway: effectiveGateway.gatewayName,
+          mode: effectiveGateway.mode,
+          createdAt: new Date().toISOString()
+        }
+      : {
+          gateway: 'کارت به کارت / واریز مستقیم',
+          createdAt: new Date().toISOString()
+        },
+    paymentAttempts: [],
+    inventoryDeducted: false,
+    idempotencyKey: sanitized.idempotencyKey,
     trackingCode
   };
 
   dbOrders.unshift(newOrder);
-  savePersistentState();
+  savePersistentState(true);
+
+  const paymentToken = await signOrderPaymentToken(newOrder);
+  res.cookie('morico_pay_order', paymentToken, {
+    httpOnly: true,
+    secure: isProduction,
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 4 * 60 * 60 * 1000
+  });
 
   recordAuditLog({
     event: 'ORDER_STATUS_CHANGED',
@@ -1582,153 +1952,603 @@ app.post('/api/orders', (req, res) => {
     severity: 'info'
   });
 
-  res.status(201).json(newOrder);
+  res.status(201).json({ ...newOrder, paymentToken });
 });
 
 // ============================================================================
-// 4. ZARINPAL IPG VERIFICATION & IDEMPOTENT CALLBACK (OWASP ASVS V10, V17)
+// 4. ZARINPAL IPG REQUEST, IDEMPOTENT CALLBACK & VERIFICATION (OWASP ASVS V10, V17)
 // ============================================================================
+const paymentRateLimiter = createGeneralRateLimiter(
+  process.env.NODE_ENV === 'test' ? 200 : 30,
+  5 * 60 * 1000,
+  'rate_limit_pay'
+);
 
-// Server-Side Payment Verification Endpoint
-app.post('/api/payments/zarinpal/verify', async (req, res) => {
+async function finalizeVerifiedOrderPayment(
+  order: any,
+  verifyResult: ZarinPalVerifyResult,
+  authority: string,
+  ip: string
+): Promise<{ ok: true; alreadyPaid?: boolean } | { ok: false; error: string }> {
+  if (isPaidOrFulfilledOrderStatus(order.status)) {
+    return { ok: true, alreadyPaid: true };
+  }
+  if (!isValidOrderStatusTransition(order.status as OrderStatus, 'PAID')) {
+    return { ok: false, error: 'تغییر وضعیت سفارش به حالت پرداخت‌شده مجاز نمی‌باشد.' };
+  }
+
+  const paidAt = new Date().toISOString();
+  order.status = 'PAID';
+  order.paymentStatus = 'SUCCESS';
+  order.paidAt = paidAt;
+  order.paymentInfo = {
+    ...order.paymentInfo,
+    gateway: order.paymentInfo?.gateway || 'زرین‌پال (ZarinPal IPG)',
+    authority,
+    refId: verifyResult.refId,
+    cardPanMask: verifyResult.cardPan,
+    cardHash: verifyResult.cardHash,
+    feeType: verifyResult.feeType,
+    fee: verifyResult.fee,
+    paidAt,
+    verifiedAt: paidAt,
+    lastError: undefined
+  };
+
+  if (Array.isArray(order.paymentAttempts)) {
+    for (const att of order.paymentAttempts) {
+      if (att.authority === authority) {
+        att.status = 'SUCCESS';
+        att.refId = verifyResult.refId;
+        att.cardPanMask = verifyResult.cardPan;
+        att.cardHash = verifyResult.cardHash;
+        att.feeType = verifyResult.feeType;
+        att.fee = verifyResult.fee;
+        att.verifyCode = verifyResult.code;
+        att.verifiedAt = paidAt;
+        att.updatedAt = paidAt;
+      } else if (att.status === 'PENDING' || att.status === 'INITIATED' || att.status === 'AMBIGUOUS') {
+        att.status = 'EXPIRED';
+        att.updatedAt = paidAt;
+      }
+    }
+  }
+
+  decrementOrderInventoryOnce(order, ip);
+  savePersistentState(true);
+
+  recordAuditLog({
+    event: 'PAYMENT_VERIFICATION_SUCCESS',
+    ip,
+    details: `پرداخت سفارش ${order.orderNumber} با کد پیگیری زرین‌پال ${verifyResult.refId} تایید و وضعیت به PAID ارتقا یافت.`,
+    severity: 'info'
+  });
+
+  return { ok: true };
+}
+
+// Initiate ZarinPal v4 Payment Request (Server-Side Amount & Stock Validation)
+const handleZarinPalRequest = async (req: Request, res: Response) => {
+  const ip = req.ip || '127.0.0.1';
+  const { orderId, orderNumber, idempotencyKey } = req.body || {};
+
+  if (!orderId && !orderNumber) {
+    return res.status(400).json({ error: 'شماره یا شناسه سفارش الزامی است.' });
+  }
+
+  const lookupKey = String(orderNumber || orderId).trim();
+  const order = dbOrders.find(
+    (o) => o.id === lookupKey || o.orderNumber.toUpperCase() === lookupKey.toUpperCase()
+  );
+
+  if (!order) {
+    return res.status(404).json({ error: 'سفارش مورد نظر یافت نشد.' });
+  }
+
+  if (!(await isAuthorizedForOrderPayment(req, order))) {
+    return res.status(403).json({ error: 'دسترسی غیرمجاز به عملیات پرداخت این سفارش.' });
+  }
+
+  return await withOrderLock(order.id, async () => {
+    if (isPaidOrFulfilledOrderStatus(order.status)) {
+      return res.status(409).json({
+        error: 'این سفارش قبلاً پرداخت و تایید شده است و امکان ایجاد تراکنش تکراری وجود ندارد.'
+      });
+    }
+
+    if (isCancelledOrderStatus(order.status) || order.status === 'REFUNDED' || order.status === 'RETURNED') {
+      return res.status(400).json({
+        error: 'این سفارش لغو یا مسترد شده است و امکان پرداخت آن وجود ندارد.'
+      });
+    }
+
+    const effective = getEffectiveGatewayConfig();
+    if (!effective.ready) {
+      return res.status(400).json({
+        error: effective.disabledReason || 'درگاه پرداخت اینترنتی در حال حاضر آماده نیست.'
+      });
+    }
+
+    // Validate live stock right before forwarding user to ZarinPal
+    const stockCheck = checkOrderItemsStock(order);
+    if ('error' in stockCheck) {
+      return res.status(400).json({ error: stockCheck.error });
+    }
+
+    const attempts: any[] = Array.isArray(order.paymentAttempts) ? order.paymentAttempts : [];
+    order.paymentAttempts = attempts;
+
+    // Idempotency: return active pending attempt if same idempotencyKey or rapid retry (< 25s)
+    const nowMs = Date.now();
+    const reusableAttempt = attempts.find((att) => {
+      if (att.status !== 'PENDING' || !att.authority) return false;
+      if (idempotencyKey && att.idempotencyKey === idempotencyKey) return true;
+      const ageMs = nowMs - new Date(att.createdAt).getTime();
+      return ageMs >= 0 && ageMs < 25000 && att.mode === effective.mode;
+    });
+
+    if (reusableAttempt) {
+      const paymentUrl =
+        reusableAttempt.paymentUrl ||
+        `https://${reusableAttempt.mode === 'production' ? 'payment' : 'sandbox'}.zarinpal.com/pg/StartPay/${encodeURIComponent(reusableAttempt.authority)}`;
+      recordAuditLog({
+        event: 'PAYMENT_DUPLICATE_BLOCKED',
+        ip,
+        details: `درخواست تکراری اتصال درگاه برای سفارش ${order.orderNumber} به همان Authority فعال هدایت شد.`,
+        severity: 'info'
+      });
+      return res.json({
+        success: true,
+        authority: reusableAttempt.authority,
+        paymentUrl,
+        attemptId: reusableAttempt.id,
+        orderNumber: order.orderNumber,
+        mode: reusableAttempt.mode,
+        idempotent: true
+      });
+    }
+
+    // Mark stale PENDING attempts as EXPIRED before starting a fresh attempt
+    for (const att of attempts) {
+      if (att.status === 'PENDING' || att.status === 'INITIATED') {
+        att.status = 'EXPIRED';
+        att.updatedAt = new Date().toISOString();
+      }
+    }
+
+    // Reopen PAYMENT_FAILED back to PENDING_PAYMENT safely on retry
+    if (order.status === 'PAYMENT_FAILED' && isValidOrderStatusTransition('PAYMENT_FAILED', 'PENDING_PAYMENT')) {
+      order.status = 'PENDING_PAYMENT';
+    }
+
+    const amountToman = Number(order.totalAmount ?? order.total ?? 0);
+    const amountRials = tomanToRial(amountToman);
+    const attemptId = `att-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const nowIso = new Date().toISOString();
+
+    const callbackUrl = effective.callbackUrl || getCallbackUrl(req);
+    const reqResult = await requestZarinPalPayment({
+      merchantId: effective.merchantId,
+      amountToman,
+      description: `پرداخت سفارش ${order.orderNumber} - فروشگاه MORICO STYLE`,
+      callbackUrl,
+      mode: effective.mode,
+      mobile: order.customerPhone,
+      email: order.customerEmail,
+      orderId: order.orderNumber
+    });
+
+    if (!reqResult.success || !reqResult.authority || !reqResult.paymentUrl) {
+      attempts.push({
+        id: attemptId,
+        amountToman,
+        amountRials,
+        currency: 'IRR',
+        mode: effective.mode,
+        gateway: effective.gatewayName,
+        status: 'FAILED',
+        errorCode: reqResult.code,
+        errorMessage: reqResult.message,
+        idempotencyKey,
+        createdAt: nowIso,
+        updatedAt: nowIso
+      });
+      order.paymentStatus = 'FAILED';
+      order.paymentInfo = {
+        ...order.paymentInfo,
+        lastError: reqResult.message
+      };
+      savePersistentState(true);
+
+      recordAuditLog({
+        event: 'PAYMENT_REQUEST_FAILED',
+        ip,
+        details: `ایجاد درخواست پرداخت زرین‌پال برای سفارش ${order.orderNumber} ناموفق بود (کد ${reqResult.code}): ${reqResult.message}`,
+        severity: 'warning'
+      });
+
+      return res.status(502).json({
+        error: reqResult.message || 'خطا در اتصال به درگاه پرداخت زرین‌پال.'
+      });
+    }
+
+    const newAttempt = {
+      id: attemptId,
+      authority: reqResult.authority,
+      paymentUrl: reqResult.paymentUrl,
+      amountToman,
+      amountRials,
+      currency: 'IRR',
+      mode: effective.mode,
+      gateway: effective.gatewayName,
+      status: 'PENDING',
+      feeType: reqResult.feeType,
+      fee: reqResult.fee,
+      idempotencyKey,
+      createdAt: nowIso,
+      updatedAt: nowIso
+    };
+    attempts.push(newAttempt);
+
+    order.paymentStatus = 'PENDING';
+    order.paymentInfo = {
+      ...order.paymentInfo,
+      gateway: effective.gatewayName,
+      authority: reqResult.authority,
+      attemptId,
+      mode: effective.mode,
+      lastError: undefined
+    };
+    savePersistentState(true);
+
+    recordAuditLog({
+      event: 'PAYMENT_REQUEST_CREATED',
+      ip,
+      details: `درخواست پرداخت زرین‌پال (${effective.mode}) برای سفارش ${order.orderNumber} به مبلغ ${amountToman} تومان (${amountRials} ریال) ایجاد شد.`,
+      severity: 'info'
+    });
+
+    const paymentToken = await signOrderPaymentToken(order);
+    res.cookie('morico_pay_order', paymentToken, {
+      httpOnly: true,
+      secure: isProduction,
+      sameSite: 'lax',
+      path: '/',
+      maxAge: 4 * 60 * 60 * 1000
+    });
+
+    return res.json({
+      success: true,
+      authority: reqResult.authority,
+      paymentUrl: reqResult.paymentUrl,
+      attemptId,
+      orderNumber: order.orderNumber,
+      mode: effective.mode
+    });
+  });
+};
+
+app.post('/api/payments/zarinpal/request', paymentRateLimiter, handleZarinPalRequest);
+app.post('/api/payments/request', paymentRateLimiter, handleZarinPalRequest);
+
+// ZarinPal Gateway Browser Callback (Matches strictly by Authority)
+app.get('/api/payments/zarinpal/callback', async (req, res) => {
+  const ip = req.ip || '127.0.0.1';
+  const authority = typeof req.query.Authority === 'string' ? req.query.Authority.trim() : '';
+  const statusParam = typeof req.query.Status === 'string' ? req.query.Status.trim().toUpperCase() : '';
+
+  if (!authority || authority.length < 8) {
+    return res.redirect('/?payment=failed&reason=invalid_callback');
+  }
+
+  // Strictly match order ONLY by Authority (no fallback to untrusted query orderNumber)
+  const order = dbOrders.find(
+    (o) =>
+      o.paymentInfo?.authority === authority ||
+      (Array.isArray(o.paymentAttempts) && o.paymentAttempts.some((a: any) => a.authority === authority))
+  );
+
+  if (!order) {
+    recordAuditLog({
+      event: 'PAYMENT_CALLBACK_RECEIVED',
+      ip,
+      details: `بازگشت درگاه زرین‌پال با شناسه نامعتبر/ناشناخته دریافت شد.`,
+      severity: 'warning'
+    });
+    return res.redirect('/?payment=failed&reason=order_not_found');
+  }
+
+  return await withOrderLock(order.id, async () => {
+    const refreshCookie = async () => {
+      const paymentToken = await signOrderPaymentToken(order);
+      res.cookie('morico_pay_order', paymentToken, {
+        httpOnly: true,
+        secure: isProduction,
+        sameSite: 'lax',
+        path: '/',
+        maxAge: 4 * 60 * 60 * 1000
+      });
+    };
+
+    if (isCancelledOrderStatus(order.status) || order.status === 'REFUNDED' || order.status === 'RETURNED') {
+      await refreshCookie();
+      return res.redirect(`/?payment=failed&reason=order_cancelled&orderNumber=${encodeURIComponent(order.orderNumber)}`);
+    }
+
+    if (isPaidOrFulfilledOrderStatus(order.status)) {
+      await refreshCookie();
+      return res.redirect(`/?payment=success&orderNumber=${encodeURIComponent(order.orderNumber)}`);
+    }
+
+    const attempts: any[] = Array.isArray(order.paymentAttempts) ? order.paymentAttempts : [];
+    const matchingAttempt = attempts.find((a) => a.authority === authority);
+    const nowIso = new Date().toISOString();
+
+    recordAuditLog({
+      event: 'PAYMENT_CALLBACK_RECEIVED',
+      ip,
+      details: `بازگشت از درگاه زرین‌پال برای سفارش ${order.orderNumber} با وضعیت Status=${statusParam || 'EMPTY'} دریافت شد.`,
+      severity: 'info'
+    });
+
+    if (statusParam !== 'OK') {
+      if (matchingAttempt) {
+        matchingAttempt.status = 'CANCELLED';
+        matchingAttempt.updatedAt = nowIso;
+      }
+      order.paymentStatus = 'CANCELLED';
+      if (isValidOrderStatusTransition(order.status as OrderStatus, 'PAYMENT_FAILED')) {
+        order.status = 'PAYMENT_FAILED';
+      }
+      order.paymentInfo = {
+        ...order.paymentInfo,
+        lastError: 'پرداخت توسط کاربر لغو گردید یا در درگاه تکمیل نشد.'
+      };
+      savePersistentState(true);
+      await refreshCookie();
+      return res.redirect(`/?payment=cancelled&orderNumber=${encodeURIComponent(order.orderNumber)}`);
+    }
+
+    const effective = getEffectiveGatewayConfig();
+    const verifyMode: ZarinPalMode =
+      matchingAttempt?.mode === 'production' || matchingAttempt?.mode === 'sandbox'
+        ? matchingAttempt.mode
+        : effective.mode;
+
+    const verifyResult = await verifyZarinPalTransaction({
+      authority,
+      amountToman: Number(order.totalAmount ?? order.total ?? 0),
+      merchantId: effective.merchantId,
+      mode: verifyMode
+    });
+
+    if (verifyResult.ambiguous) {
+      if (matchingAttempt) {
+        matchingAttempt.status = 'AMBIGUOUS';
+        matchingAttempt.errorCode = verifyResult.code;
+        matchingAttempt.errorMessage = verifyResult.message;
+        matchingAttempt.updatedAt = nowIso;
+      }
+      order.paymentStatus = 'PENDING_VERIFY';
+      order.paymentInfo = {
+        ...order.paymentInfo,
+        lastError: verifyResult.message
+      };
+      savePersistentState(true);
+
+      recordAuditLog({
+        event: 'PAYMENT_VERIFY_AMBIGUOUS',
+        ip,
+        details: `تایید پرداخت سفارش ${order.orderNumber} به علت خطای شبکه/تایم‌اوت زرین‌پال مبهم ماند.`,
+        severity: 'warning'
+      });
+
+      await refreshCookie();
+      return res.redirect(`/?payment=pending_verify&orderNumber=${encodeURIComponent(order.orderNumber)}`);
+    }
+
+    if (verifyResult.success) {
+      const finalized = await finalizeVerifiedOrderPayment(order, verifyResult, authority, ip);
+      await refreshCookie();
+      if (finalized.ok) {
+        return res.redirect(`/?payment=success&orderNumber=${encodeURIComponent(order.orderNumber)}`);
+      }
+      return res.redirect(`/?payment=failed&reason=state_error&orderNumber=${encodeURIComponent(order.orderNumber)}`);
+    }
+
+    if (matchingAttempt) {
+      matchingAttempt.status = 'FAILED';
+      matchingAttempt.errorCode = verifyResult.code;
+      matchingAttempt.errorMessage = verifyResult.message;
+      matchingAttempt.updatedAt = nowIso;
+    }
+    order.paymentStatus = 'FAILED';
+    if (isValidOrderStatusTransition(order.status as OrderStatus, 'PAYMENT_FAILED')) {
+      order.status = 'PAYMENT_FAILED';
+    }
+    order.paymentInfo = {
+      ...order.paymentInfo,
+      lastError: verifyResult.message
+    };
+    savePersistentState(true);
+
+    recordAuditLog({
+      event: 'PAYMENT_VERIFICATION_FAILED',
+      ip,
+      details: `تایید پرداخت زرین‌پال برای سفارش ${order.orderNumber} ناموفق بود (کد ${verifyResult.code}): ${verifyResult.message}`,
+      severity: 'warning'
+    });
+
+    await refreshCookie();
+    return res.redirect(`/?payment=failed&reason=verification_failed&orderNumber=${encodeURIComponent(order.orderNumber)}`);
+  });
+});
+
+// Server-Side Payment Verification Endpoint (Supports Manual Re-Verify & API Verify)
+app.post('/api/payments/zarinpal/verify', paymentRateLimiter, async (req, res) => {
   const { authority, orderId, orderNumber } = req.body || {};
   const ip = req.ip || '127.0.0.1';
 
-  if (!authority || (!orderId && !orderNumber)) {
+  const cleanAuthority = typeof authority === 'string' ? authority.trim() : '';
+  if (!cleanAuthority || (!orderId && !orderNumber)) {
     return res.status(400).json({ error: 'اطلاعات تایید تراکنش (شناسه مرجع یا شماره سفارش) ناقص است.' });
   }
 
   const cleanOrderNum = String(orderNumber || orderId).trim().toUpperCase();
   const order = dbOrders.find(
-    (o) =>
-      o.id === cleanOrderNum ||
-      o.orderNumber.toUpperCase() === cleanOrderNum ||
-      o.paymentInfo?.authority === authority
+    (o) => o.id === String(orderId || orderNumber).trim() || o.orderNumber.toUpperCase() === cleanOrderNum
   );
 
   if (!order) {
     return res.status(404).json({ error: 'سفارش متناظر با این تراکنش یافت نشد.' });
   }
 
-  // Idempotency: If already verified, return idempotent success without duplicate actions
-  if (order.status === 'PAID') {
-    return res.json({
-      success: true,
-      code: 101,
-      message: 'تراکنش قبلاً با موفقیت تایید شده است (تکراری / Idempotent).',
-      order
-    });
-  }
+  // Strictly validate that Authority was actually issued for THIS order
+  const authorityBelongsToOrder =
+    order.paymentInfo?.authority === cleanAuthority ||
+    (Array.isArray(order.paymentAttempts) && order.paymentAttempts.some((a: any) => a.authority === cleanAuthority));
 
-  // Call verification engine with exact order amount check
-  const verifyResult = await verifyZarinPalTransaction(
-    authority,
-    order.totalAmount,
-    dbGatewayStatus.merchantId,
-    dbGatewayStatus.mode !== 'production'
-  );
-
-  if (!verifyResult.success) {
+  if (!authorityBelongsToOrder) {
     recordAuditLog({
       event: 'PAYMENT_VERIFICATION_FAILED',
       ip,
-      details: `تایید پرداخت زرین‌پال برای سفارش ${order.orderNumber} ناموفق بود: ${verifyResult.message}`,
-      severity: 'warning'
+      details: `تلاش تایید با Authority نامرتبط برای سفارش ${order.orderNumber} مسدود شد.`,
+      severity: 'critical'
     });
-    return res.status(400).json({ error: verifyResult.message || 'پرداخت توسط درگاه بانکی تایید نگردید.' });
+    return res.status(400).json({ error: 'شناسه مرجع تراکنش (Authority) متعلق به این سفارش نیست.' });
   }
 
-  // State Transition & Inventory Decrement
-  if (!isValidOrderStatusTransition(order.status, 'PAID')) {
-    return res.status(400).json({ error: 'تغییر وضعیت سفارش به حالت پرداخت‌شده امکان‌پذیر نمی‌باشد.' });
+  if (!(await isAuthorizedForOrderPayment(req, order))) {
+    return res.status(403).json({ error: 'دسترسی غیرمجاز برای تایید تراکنش این سفارش.' });
   }
 
-  order.status = 'PAID';
-  order.paymentStatus = 'PAID';
-  order.paymentInfo = {
-    ...order.paymentInfo,
-    refId: verifyResult.refId,
-    cardPanMask: verifyResult.cardPan || '۶۰۳۷-۹۹**-****-۲۲۴۵',
-    paidAt: new Date().toISOString()
-  };
-
-  // Decrement product inventory safely
-  for (const it of order.items || []) {
-    const prod = dbProducts.find((p) => p.id === (it.productId || it.product?.id));
-    if (prod && typeof prod.stock === 'number') {
-      prod.stock = Math.max(0, prod.stock - (it.quantity || 1));
+  return await withOrderLock(order.id, async () => {
+    if (isPaidOrFulfilledOrderStatus(order.status)) {
+      return res.json({
+        success: true,
+        code: 101,
+        message: 'تراکنش قبلاً با موفقیت تایید شده است (تکراری / Idempotent).',
+        refId: order.paymentInfo?.refId,
+        cardPanMask: order.paymentInfo?.cardPanMask,
+        order: sanitizeOrderPaymentResult(order)
+      });
     }
-  }
 
-  savePersistentState(true);
+    if (isCancelledOrderStatus(order.status) || order.status === 'REFUNDED' || order.status === 'RETURNED') {
+      return res.status(400).json({ error: 'سفارش لغو شده است و قابل تایید پرداخت نیست.' });
+    }
 
-  recordAuditLog({
-    event: 'PAYMENT_VERIFICATION_SUCCESS',
-    ip,
-    details: `پرداخت سفارش ${order.orderNumber} با شناسه مرجع زرین‌پال ${verifyResult.refId} با موفقیت تایید و وضعیت به PAID ارتقا یافت.`,
-    severity: 'info'
-  });
+    const attempts: any[] = Array.isArray(order.paymentAttempts) ? order.paymentAttempts : [];
+    const matchingAttempt = attempts.find((a) => a.authority === cleanAuthority);
+    const effective = getEffectiveGatewayConfig();
+    const verifyMode: ZarinPalMode =
+      matchingAttempt?.mode === 'production' || matchingAttempt?.mode === 'sandbox'
+        ? matchingAttempt.mode
+        : effective.mode;
 
-  res.json({
-    success: true,
-    code: 100,
-    message: 'پرداخت با موفقیت در درگاه بانکی تایید گردید.',
-    refId: verifyResult.refId,
-    order
+    const verifyResult = await verifyZarinPalTransaction({
+      authority: cleanAuthority,
+      amountToman: Number(order.totalAmount ?? order.total ?? 0),
+      merchantId: effective.merchantId,
+      mode: verifyMode
+    });
+
+    const nowIso = new Date().toISOString();
+
+    if (verifyResult.ambiguous) {
+      if (matchingAttempt) {
+        matchingAttempt.status = 'AMBIGUOUS';
+        matchingAttempt.errorCode = verifyResult.code;
+        matchingAttempt.errorMessage = verifyResult.message;
+        matchingAttempt.updatedAt = nowIso;
+      }
+      order.paymentStatus = 'PENDING_VERIFY';
+      order.paymentInfo = {
+        ...order.paymentInfo,
+        lastError: verifyResult.message
+      };
+      savePersistentState(true);
+
+      recordAuditLog({
+        event: 'PAYMENT_VERIFY_AMBIGUOUS',
+        ip,
+        details: `تایید پرداخت سفارش ${order.orderNumber} با خطای ارتباطی مواجه شد و در وضعیت Pending Verify ماند.`,
+        severity: 'warning'
+      });
+
+      return res.status(503).json({
+        success: false,
+        ambiguous: true,
+        error: verifyResult.message,
+        order: sanitizeOrderPaymentResult(order)
+      });
+    }
+
+    if (!verifyResult.success) {
+      if (matchingAttempt) {
+        matchingAttempt.status = 'FAILED';
+        matchingAttempt.errorCode = verifyResult.code;
+        matchingAttempt.errorMessage = verifyResult.message;
+        matchingAttempt.updatedAt = nowIso;
+      }
+      order.paymentStatus = 'FAILED';
+      if (isValidOrderStatusTransition(order.status as OrderStatus, 'PAYMENT_FAILED')) {
+        order.status = 'PAYMENT_FAILED';
+      }
+      order.paymentInfo = {
+        ...order.paymentInfo,
+        lastError: verifyResult.message
+      };
+      savePersistentState(true);
+
+      recordAuditLog({
+        event: 'PAYMENT_VERIFICATION_FAILED',
+        ip,
+        details: `تایید پرداخت زرین‌پال برای سفارش ${order.orderNumber} ناموفق بود: ${verifyResult.message}`,
+        severity: 'warning'
+      });
+      return res.status(400).json({ error: verifyResult.message || 'پرداخت توسط درگاه بانکی تایید نگردید.' });
+    }
+
+    const finalized = await finalizeVerifiedOrderPayment(order, verifyResult, cleanAuthority, ip);
+    if ('error' in finalized) {
+      return res.status(400).json({ error: finalized.error });
+    }
+
+    return res.json({
+      success: true,
+      code: verifyResult.code,
+      message: verifyResult.message,
+      refId: verifyResult.refId,
+      cardPanMask: verifyResult.cardPan,
+      order: sanitizeOrderPaymentResult(order)
+    });
   });
 });
 
-// ZarinPal Gateway Browser Callback
-app.get('/api/payments/zarinpal/callback', async (req, res) => {
-  const { Authority, Status, orderNumber } = req.query;
-
-  if (Status !== 'OK' || !Authority) {
-    return res.redirect(`/?payment=failed&authority=${encodeURIComponent(String(Authority || ''))}`);
+// Secure Payment Result Lookup after Redirect Callback
+app.get('/api/payments/orders/:orderNumber/result', async (req, res) => {
+  const cleanNum = String(req.params.orderNumber || '').trim().toUpperCase();
+  if (!cleanNum) {
+    return res.status(400).json({ error: 'شماره سفارش الزامی است.' });
   }
 
   const order = dbOrders.find(
-    (o) =>
-      o.paymentInfo?.authority === Authority ||
-      (orderNumber && o.orderNumber === String(orderNumber).trim().toUpperCase())
+    (o) => o.orderNumber.toUpperCase() === cleanNum || o.id === req.params.orderNumber
   );
 
   if (!order) {
-    return res.redirect('/?payment=failed&reason=order_not_found');
+    return res.status(404).json({ error: 'سفارش مورد نظر یافت نشد.' });
   }
 
-  if (order.status === 'PAID') {
-    return res.redirect(`/?payment=success&orderNumber=${encodeURIComponent(order.orderNumber)}`);
+  if (!(await isAuthorizedForOrderPayment(req, order))) {
+    return res.status(403).json({ error: 'برای مشاهده رسید این سفارش، احراز هویت یا شماره تماس ثبت‌شده الزامی است.' });
   }
 
-  const verifyResult = await verifyZarinPalTransaction(
-    String(Authority),
-    order.totalAmount,
-    dbGatewayStatus.merchantId,
-    dbGatewayStatus.mode !== 'production'
-  );
-
-  if (verifyResult.success) {
-    order.status = 'PAID';
-    order.paymentStatus = 'PAID';
-    order.paymentInfo = {
-      ...order.paymentInfo,
-      refId: verifyResult.refId,
-      cardPanMask: verifyResult.cardPan || '۶۰۳۷-۹۹**-****-۲۲۴۵',
-      paidAt: new Date().toISOString()
-    };
-
-    for (const it of order.items || []) {
-      const prod = dbProducts.find((p) => p.id === (it.productId || it.product?.id));
-      if (prod && typeof prod.stock === 'number') {
-        prod.stock = Math.max(0, prod.stock - (it.quantity || 1));
-      }
-    }
-    savePersistentState(true);
-
-    return res.redirect(`/?payment=success&orderNumber=${encodeURIComponent(order.orderNumber)}`);
-  }
-
-  res.redirect(`/?payment=failed&reason=verification_failed&authority=${encodeURIComponent(String(Authority))}`);
+  return res.json({
+    success: true,
+    order: sanitizeOrderPaymentResult(order)
+  });
 });
 
 // ============================================================================
@@ -1763,19 +2583,26 @@ app.post('/api/orders/track', createTrackingRateLimiter(20, 10 * 60 * 1000), (re
 
   // Sanitized tracking response (only safe public fields, protects full customer address)
   res.json({
+    id: found.orderNumber,
     orderNumber: found.orderNumber,
     date: found.date,
+    createdAt: found.date,
     status: found.status,
+    paymentStatus: found.paymentStatus,
+    paymentMethod: found.paymentMethod,
     trackingCode: found.trackingCode,
     customerProvince: found.province || 'تهران',
     customerCity: found.city || 'تهران',
     itemsCount: found.items?.length || 0,
+    total: found.totalAmount || found.total || 0,
     totalAmount: found.totalAmount || found.total || 0,
     items: (found.items || []).map((it: any) => ({
       productName: it.product?.name || 'محصول آتلیه MORICO',
       color: it.selectedColor,
       size: it.selectedSize,
       quantity: it.quantity,
+      unitPrice: it.unitPrice ?? it.product?.price ?? 0,
+      image: it.product?.image || it.product?.imageUrl,
       hasCustomization: Boolean(it.customization)
     }))
   });
@@ -2019,7 +2846,7 @@ app.get('/api/admin/orders', requireAdmin, (req, res) => {
   res.json(dbOrders);
 });
 
-app.put('/api/orders/:id/status', requireAdmin, (req: AuthenticatedRequest, res) => {
+app.put('/api/orders/:id/status', requireAdmin, async (req: AuthenticatedRequest, res) => {
   const { id } = req.params;
   const { status } = req.body || {};
 
@@ -2032,31 +2859,41 @@ app.put('/api/orders/:id/status', requireAdmin, (req: AuthenticatedRequest, res)
     return res.status(404).json({ error: 'سفارش مورد نظر یافت نشد.' });
   }
 
-  const currentStatus = order.status as OrderStatus;
-  if (!isValidOrderStatusTransition(currentStatus, status as OrderStatus)) {
-    return res.status(400).json({
-      error: `تغییر وضعیت سفارش از حالت «${currentStatus}» به حالت «${status}» بر اساس چرخه سفارشات مجاز نمی‌باشد.`
+  return await withOrderLock(order.id, async () => {
+    const currentStatus = order.status as OrderStatus;
+    if (!isValidOrderStatusTransition(currentStatus, status as OrderStatus)) {
+      return res.status(400).json({
+        error: `تغییر وضعیت سفارش از حالت «${currentStatus}» به حالت «${status}» بر اساس چرخه سفارشات مجاز نمی‌باشد.`
+      });
+    }
+
+    order.status = status;
+    if (status === 'PAID') {
+      order.paymentStatus = 'SUCCESS';
+      order.paidAt = order.paidAt || new Date().toISOString();
+      order.paymentInfo = {
+        ...order.paymentInfo,
+        paidAt: order.paymentInfo?.paidAt || order.paidAt,
+        verifiedAt: order.paymentInfo?.verifiedAt || order.paidAt
+      };
+      decrementOrderInventoryOnce(order, req.ip || '127.0.0.1');
+    } else if (isCancelledOrderStatus(status) || status === 'REFUNDED') {
+      order.paymentStatus = status === 'REFUNDED' ? 'REFUNDED' : 'CANCELLED';
+      restoreOrderInventoryOnce(order);
+    }
+
+    savePersistentState(true);
+
+    recordAuditLog({
+      event: 'ORDER_STATUS_CHANGED',
+      username: req.user?.username,
+      ip: req.ip || '127.0.0.1',
+      details: `وضعیت سفارش ${order.orderNumber} از «${currentStatus}» به «${status}» تغییر یافت.`,
+      severity: 'info'
     });
-  }
 
-  order.status = status;
-  if (status === 'PAID') {
-    order.paymentStatus = 'PAID';
-  } else if (status === 'CANCELLED') {
-    order.paymentStatus = 'CANCELLED';
-  }
-
-  savePersistentState();
-
-  recordAuditLog({
-    event: 'ORDER_STATUS_CHANGED',
-    username: req.user?.username,
-    ip: req.ip || '127.0.0.1',
-    details: `وضعیت سفارش ${order.orderNumber} از «${currentStatus}» به «${status}» تغییر یافت.`,
-    severity: 'info'
+    res.json(order);
   });
-
-  res.json(order);
 });
 
 // Admin Discounts CRUD
@@ -2185,27 +3022,86 @@ app.put('/api/top-weekly', requireAdmin, (req: AuthenticatedRequest, res) => {
   res.status(400).json({ error: 'داده‌های ارسالی نامعتبر است.' });
 });
 
-// Admin Gateway Configuration
+// Admin Gateway Configuration (Never leaks raw merchantId back to frontend or audit logs)
+app.get('/api/admin/payments/gateway', requireAdmin, (req: AuthenticatedRequest, res) => {
+  const effective = getEffectiveGatewayConfig();
+  res.json({
+    gatewayName: effective.gatewayName,
+    configured: effective.configured,
+    ready: effective.ready,
+    mode: effective.mode,
+    merchantId: '',
+    hasMerchantId: effective.hasMerchantId,
+    merchantIdMasked: effective.merchantIdMasked,
+    envManaged: effective.envManaged,
+    callbackUrl: effective.callbackUrl || getCallbackUrl(req),
+    disabledReason: effective.disabledReason
+  });
+});
+
 app.put('/api/admin/payments/gateway', requireAdmin, (req: AuthenticatedRequest, res) => {
   const { gatewayName, configured, mode, merchantId, disabledReason } = req.body || {};
+  const nextConfigured = Boolean(configured);
+  const nextMode: ZarinPalMode = mode === 'production' ? 'production' : 'sandbox';
+
+  let nextMerchant = String(dbGatewayStatus.merchantId || '').trim();
+  const submittedMerchant = typeof merchantId === 'string' ? merchantId.trim() : '';
+
+  // Ignore masked placeholder strings so editing other fields preserves existing merchantId
+  const isMaskedPlaceholder = submittedMerchant.includes('****');
+  if (submittedMerchant && !isMaskedPlaceholder) {
+    if (!isValidMerchantId(submittedMerchant)) {
+      return res.status(400).json({
+        error: 'فرمت کد مرچنت (Merchant ID) نامعتبر است. کد مرچنت زرین‌پال باید یک شناسه UUID ۳۶ کاراکتری استاندارد باشد.'
+      });
+    }
+    nextMerchant = submittedMerchant;
+  } else if (merchantId === '' && !nextConfigured && !process.env.ZARINPAL_MERCHANT_ID) {
+    // Allow clearing stored merchantId only when disabling gateway
+    nextMerchant = '';
+  }
+
+  const effectiveCandidateMerchant = (process.env.ZARINPAL_MERCHANT_ID || '').trim() || nextMerchant;
+  if (nextConfigured && !isValidMerchantId(effectiveCandidateMerchant)) {
+    return res.status(400).json({
+      error: 'برای فعال‌سازی درگاه پرداخت آنلاین، ثبت یک کد مرچنت (Merchant ID) معتبر ۳۶ کاراکتری الزامی است.'
+    });
+  }
+
   dbGatewayStatus = {
     gatewayName: gatewayName || dbGatewayStatus.gatewayName || 'زرین‌پال (ZarinPal IPG)',
-    configured: Boolean(configured),
-    mode: mode === 'production' ? 'production' : 'sandbox',
-    merchantId: merchantId !== undefined ? merchantId : dbGatewayStatus.merchantId || '',
-    disabledReason: disabledReason || 'درگاه پرداخت اینترنتی هنوز متصل نشده است.'
+    configured: nextConfigured,
+    mode: nextMode,
+    merchantId: nextMerchant,
+    disabledReason:
+      disabledReason ||
+      dbGatewayStatus.disabledReason ||
+      'درگاه پرداخت اینترنتی هنوز متصل نشده است و در انتظار فعال‌سازی توسط مدیریت فروشگاه می‌باشد.'
   };
   savePersistentState(true);
+
+  const effective = getEffectiveGatewayConfig();
 
   recordAuditLog({
     event: 'SETTINGS_MUTATION',
     username: req.user?.username,
     ip: req.ip || '127.0.0.1',
-    details: `پیکربندی درگاه بانکی تغییر کرد: وضعیت ${dbGatewayStatus.configured ? 'فعال' : 'غیرفعال'}`,
+    details: `پیکربندی درگاه بانکی تغییر کرد: وضعیت ${effective.configured ? 'فعال' : 'غیرفعال'} (${effective.mode})`,
     severity: 'warning'
   });
 
-  res.json(dbGatewayStatus);
+  res.json({
+    gatewayName: effective.gatewayName,
+    configured: effective.configured,
+    ready: effective.ready,
+    mode: effective.mode,
+    merchantId: '',
+    hasMerchantId: effective.hasMerchantId,
+    merchantIdMasked: effective.merchantIdMasked,
+    envManaged: effective.envManaged,
+    callbackUrl: effective.callbackUrl || getCallbackUrl(req),
+    disabledReason: effective.disabledReason
+  });
 });
 
 // Admin File Upload with Strict Magic-Bytes, Sharp Re-Encoding & Anti-SVG Stored XSS (OWASP ASVS V12)

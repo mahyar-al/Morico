@@ -66,7 +66,12 @@ export const AdminOrders: React.FC<AdminOrdersProps> = ({
       case 'PAYMENT_FAILED':
         return { label: 'خطا در پرداخت', className: 'bg-[#A33A3A]/10 text-[#A33A3A] border-[#A33A3A]/30' };
       case 'CANCELED':
+      case 'CANCELLED':
         return { label: 'لغو شده', className: 'bg-[#A33A3A]/15 text-[#A33A3A] border-[#A33A3A]/40' };
+      case 'RETURNED':
+        return { label: 'مرجوع شده', className: 'bg-amber-50 text-amber-800 border-amber-300' };
+      case 'REFUNDED':
+        return { label: 'مسترد شده', className: 'bg-amber-50 text-amber-800 border-amber-300' };
       default:
         return { label: status, className: 'bg-gray-100 text-gray-800 border-gray-300' };
     }
@@ -82,9 +87,16 @@ export const AdminOrders: React.FC<AdminOrdersProps> = ({
       o.customerName.toLowerCase().includes(q) ||
       o.customerPhone.includes(q);
 
-    const matchesStatus = statusFilter === 'all' || o.status === statusFilter;
+    const normalizedStatus = o.status === 'CANCELED' ? 'CANCELLED' : o.status;
+    const matchesStatus =
+      statusFilter === 'all' ||
+      o.status === statusFilter ||
+      (statusFilter === 'CANCELLED' && normalizedStatus === 'CANCELLED');
+
+    const ps = (o.paymentStatus || 'PENDING').toUpperCase();
     const matchesPayment =
-      paymentFilter === 'all' || (o.paymentStatus || 'PENDING') === paymentFilter;
+      paymentFilter === 'all' ||
+      (paymentFilter === 'PAID' ? ps === 'PAID' || ps === 'SUCCESS' : ps === paymentFilter);
 
     const hasCustom = o.items.some((i) => i.customization) || Boolean(o.customization);
     const matchesCustom =
@@ -163,7 +175,7 @@ export const AdminOrders: React.FC<AdminOrdersProps> = ({
         `"${o.customerCity || ''}"`,
         `"${o.customerAddress.replace(/"/g, '""')}"`,
         `"${o.customerPostal}"`,
-        o.total,
+        o.total ?? o.totalAmount ?? 0,
         o.status,
         o.paymentStatus || 'PENDING',
         hasCustom ? 'بله' : 'خیر'
@@ -240,7 +252,9 @@ export const AdminOrders: React.FC<AdminOrdersProps> = ({
             <option value="DELIVERED">تحویل شده</option>
             <option value="PENDING_PAYMENT">در انتظار پرداخت</option>
             <option value="PAYMENT_FAILED">خطا در پرداخت</option>
-            <option value="CANCELED">لغو شده</option>
+            <option value="CANCELLED">لغو شده</option>
+            <option value="RETURNED">مرجوع شده</option>
+            <option value="REFUNDED">مسترد شده</option>
           </select>
 
           {/* Payment Status Filter */}
@@ -253,9 +267,11 @@ export const AdminOrders: React.FC<AdminOrdersProps> = ({
             className="px-3 py-2 rounded-xl border border-[#BFDDF0] bg-white text-[#111110] focus:outline-none cursor-pointer"
           >
             <option value="all">همه وضعیت‌های تراکنش</option>
-            <option value="PAID">موفق (PAID)</option>
+            <option value="PAID">موفق (SUCCESS / PAID)</option>
             <option value="PENDING">در انتظار (PENDING)</option>
+            <option value="PENDING_VERIFY">نیازمند بررسی (PENDING_VERIFY)</option>
             <option value="FAILED">ناموفق (FAILED)</option>
+            <option value="CANCELLED">لغوشده (CANCELLED)</option>
           </select>
 
           {/* Custom Design Filter */}
@@ -301,7 +317,7 @@ export const AdminOrders: React.FC<AdminOrdersProps> = ({
                 <option value="PROCESSING">تغییر به: در حال پردازش و چاپ</option>
                 <option value="SHIPPED">تغییر به: تحویل به پست پیشتاز</option>
                 <option value="DELIVERED">تغییر به: تحویل داده شده</option>
-                <option value="CANCELED">تغییر به: لغو شده</option>
+                <option value="CANCELLED">تغییر به: لغو شده</option>
               </select>
               <button
                 onClick={handleBulkStatusApply}
@@ -426,7 +442,7 @@ export const AdminOrders: React.FC<AdminOrdersProps> = ({
                       {/* Quick Status Select */}
                       <td className="py-3 px-4" onClick={(e) => e.stopPropagation()}>
                         <select
-                          value={order.status}
+                          value={order.status === 'CANCELED' ? 'CANCELLED' : order.status}
                           onChange={(e) => onUpdateStatus(order.id, e.target.value as OrderStatus)}
                           className={`px-2.5 py-1 rounded-lg border text-xs font-semibold focus:outline-none cursor-pointer ${badge.className}`}
                         >
@@ -436,7 +452,9 @@ export const AdminOrders: React.FC<AdminOrdersProps> = ({
                           <option value="SHIPPED">ارسال پست</option>
                           <option value="DELIVERED">تحویل شد</option>
                           <option value="PAYMENT_FAILED">خطا بانک</option>
-                          <option value="CANCELED">لغو شده</option>
+                          <option value="CANCELLED">لغو شده</option>
+                          <option value="RETURNED">مرجوع شده</option>
+                          <option value="REFUNDED">مسترد شده</option>
                         </select>
                       </td>
 

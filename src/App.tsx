@@ -8,7 +8,8 @@ import { HowOnlineDesignWorks } from './components/HowOnlineDesignWorks';
 import { ShopCatalog } from './components/ShopCatalog';
 import { ProductDetailModal } from './components/ProductDetailModal';
 import { CartDrawer } from './components/CartDrawer';
-import { CheckoutModal } from './components/CheckoutModal';
+import { CheckoutModal, PaymentCallbackResult } from './components/CheckoutModal';
+import { adminApi } from './lib/adminApi';
 import { OrderTracking } from './components/OrderTracking';
 import { StoryAndFaq } from './components/StoryAndFaq';
 import { StaticPageModal } from './components/StaticPageModal';
@@ -56,6 +57,7 @@ export default function App() {
   const [appliedPromoCode, setAppliedPromoCode] = useState('');
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState<string>('all');
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+  const [paymentCallbackResult, setPaymentCallbackResult] = useState<PaymentCallbackResult | null>(null);
 
   // Authentication State for storefront
   const [currentUser, setCurrentUser] = useState<User | null>(() => {
@@ -96,6 +98,89 @@ export default function App() {
       window.removeEventListener('popstate', handlePopState);
       window.removeEventListener('hashchange', handlePopState);
     };
+  }, []);
+
+  // Detect ZarinPal callback URL parameters on mount and fetch verified order result
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const params = new URLSearchParams(window.location.search);
+    const paymentStatusParam = params.get('payment');
+    if (!paymentStatusParam) return;
+
+    const orderNumberParam = params.get('orderNumber') || undefined;
+    const reasonParam = params.get('reason') || undefined;
+
+    // Clean callback query params immediately from address bar
+    window.history.replaceState(null, '', window.location.pathname || '/');
+
+    const validType: PaymentCallbackResult['type'] =
+      paymentStatusParam === 'success'
+        ? 'success'
+        : paymentStatusParam === 'cancelled'
+        ? 'cancelled'
+        : paymentStatusParam === 'pending_verify'
+        ? 'pending_verify'
+        : 'failed';
+
+    setIsCheckoutOpen(true);
+    setPaymentCallbackResult({
+      type: validType,
+      orderNumber: orderNumberParam,
+      reason: reasonParam,
+      loading: Boolean(orderNumberParam)
+    });
+
+    if (!orderNumberParam) return;
+
+    let savedToken: string | undefined;
+    let savedPhone: string | undefined;
+    try {
+      const raw = sessionStorage.getItem('morico_pending_payment');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        if (!parsed.orderNumber || parsed.orderNumber === orderNumberParam) {
+          savedToken = parsed.paymentToken;
+          savedPhone = parsed.phone;
+        }
+      }
+    } catch {}
+
+    adminApi
+      .getPaymentResult(orderNumberParam, savedToken, savedPhone)
+      .then((res) => {
+        const order = res?.order;
+        if (order && (order.status === 'PAID' || order.status === 'PROCESSING' || order.status === 'SHIPPED' || order.status === 'DELIVERED')) {
+          store.addOrder(order);
+          try {
+            sessionStorage.removeItem('morico_pending_payment');
+          } catch {}
+          setPaymentCallbackResult({
+            type: 'success',
+            orderNumber: order.orderNumber,
+            order,
+            loading: false
+          });
+          showToast('success', `پرداخت سفارش ${order.orderNumber} با موفقیت تایید شد.`);
+        } else {
+          setPaymentCallbackResult({
+            type: validType,
+            orderNumber: orderNumberParam,
+            reason: reasonParam,
+            order: order || null,
+            message: order?.paymentInfo?.lastError,
+            loading: false
+          });
+        }
+      })
+      .catch((err: any) => {
+        setPaymentCallbackResult({
+          type: validType,
+          orderNumber: orderNumberParam,
+          reason: reasonParam,
+          message: err?.message,
+          loading: false
+        });
+      });
   }, []);
 
   // Update URL, meta robots, and title when isAdminView or activeSection or siteTitle changes
@@ -209,6 +294,89 @@ export default function App() {
   const handleOrderSuccess = (newOrder: Order) => {
     store.addOrder(newOrder);
     showToast('success', `سفارش شما با شماره ${newOrder.orderNumber} با موفقیت ثبت شد.`);
+  };
+
+  const handleReverifyCallbackOrder = async (order: Order) => {
+    let savedToken: string | undefined;
+    let savedPhone: string | undefined;
+    try {
+      const raw = sessionStorage.getItem('morico_pending_payment');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        savedToken = parsed.paymentToken;
+        savedPhone = parsed.phone;
+      }
+    } catch {}
+
+    const authority = order.paymentInfo?.authority;
+    if (!authority) {
+      setPaymentCallbackResult({
+        type: 'failed',
+        orderNumber: order.orderNumber,
+        order,
+        message: 'شناسه مرجع بانکی (Authority) برای بررسی مجدد یافت نشد.'
+      });
+      return;
+    }
+
+    try {
+      const verifyRes = await adminApi.verifyZarinPalPayment({
+        authority,
+        orderNumber: order.orderNumber,
+        orderId: order.id,
+        paymentToken: savedToken,
+        phone: savedPhone || order.customerPhone
+      });
+      if (verifyRes.success && verifyRes.order) {
+        store.addOrder(verifyRes.order);
+        try {
+          sessionStorage.removeItem('morico_pending_payment');
+        } catch {}
+        setPaymentCallbackResult({
+          type: 'success',
+          orderNumber: verifyRes.order.orderNumber,
+          order: verifyRes.order
+        });
+        showToast('success', `پرداخت سفارش ${verifyRes.order.orderNumber} با موفقیت تایید شد.`);
+      }
+    } catch (err: any) {
+      setPaymentCallbackResult({
+        type: err?.status === 503 ? 'pending_verify' : 'failed',
+        orderNumber: order.orderNumber,
+        order,
+        message: err?.message || 'بررسی مجدد تراکنش ناموفق بود.'
+      });
+    }
+  };
+
+  const handleRetryCallbackOrder = async (order: Order) => {
+    let savedToken: string | undefined;
+    let savedPhone: string | undefined;
+    try {
+      const raw = sessionStorage.getItem('morico_pending_payment');
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        savedToken = parsed.paymentToken;
+        savedPhone = parsed.phone;
+      }
+    } catch {}
+
+    try {
+      const reqRes = await adminApi.requestZarinPalPayment({
+        orderNumber: order.orderNumber,
+        orderId: order.id,
+        paymentToken: savedToken,
+        phone: savedPhone || order.customerPhone
+      });
+      window.location.assign(reqRes.paymentUrl);
+    } catch (err: any) {
+      setPaymentCallbackResult({
+        type: 'failed',
+        orderNumber: order.orderNumber,
+        order,
+        message: err?.message || 'خطا در اتصال مجدد به درگاه زرین‌پال.'
+      });
+    }
   };
 
   const handleAddToCart = (
@@ -598,6 +766,10 @@ export default function App() {
         appliedCode={appliedPromoCode}
         currentUser={currentUser}
         onOrderSuccess={handleOrderSuccess}
+        callbackResult={paymentCallbackResult}
+        onClearCallbackResult={() => setPaymentCallbackResult(null)}
+        onReverifyCallbackOrder={handleReverifyCallbackOrder}
+        onRetryCallbackOrder={handleRetryCallbackOrder}
         onNavigateToTracking={() => {
           setActiveSection('track');
           window.scrollTo({ top: 0, behavior: 'smooth' });

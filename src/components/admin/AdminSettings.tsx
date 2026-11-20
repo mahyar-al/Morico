@@ -44,10 +44,17 @@ export const AdminSettings: React.FC<AdminSettingsProps> = ({ gatewayStatus }) =
   const [gwStatus, setGwStatus] = useState<PaymentGatewayStatus>(() => ({
     gatewayName: gatewayStatus?.gatewayName || 'زرین‌پال (ZarinPal IPG)',
     configured: Boolean(gatewayStatus?.configured),
+    ready: Boolean(gatewayStatus?.ready),
     mode: gatewayStatus?.mode || 'sandbox',
-    merchantId: gatewayStatus?.merchantId || '',
+    merchantId: '',
+    hasMerchantId: Boolean(gatewayStatus?.hasMerchantId),
+    merchantIdMasked: gatewayStatus?.merchantIdMasked || '',
+    envManaged: Boolean(gatewayStatus?.envManaged),
+    callbackUrl: gatewayStatus?.callbackUrl || '',
     disabledReason: gatewayStatus?.disabledReason || 'درگاه پرداخت اینترنتی هنوز متصل نشده است.'
   }));
+  const [merchantIdInput, setMerchantIdInput] = useState('');
+  const [clearStoredMerchant, setClearStoredMerchant] = useState(false);
   const [isSavingGw, setIsSavingGw] = useState(false);
   const [gwSuccess, setGwSuccess] = useState<string | null>(null);
   const [gwError, setGwError] = useState<string | null>(null);
@@ -57,8 +64,13 @@ export const AdminSettings: React.FC<AdminSettingsProps> = ({ gatewayStatus }) =
       setGwStatus({
         gatewayName: gatewayStatus.gatewayName || 'زرین‌پال (ZarinPal IPG)',
         configured: Boolean(gatewayStatus.configured),
+        ready: Boolean(gatewayStatus.ready),
         mode: gatewayStatus.mode || 'sandbox',
-        merchantId: gatewayStatus.merchantId || '',
+        merchantId: '',
+        hasMerchantId: Boolean(gatewayStatus.hasMerchantId),
+        merchantIdMasked: gatewayStatus.merchantIdMasked || '',
+        envManaged: Boolean(gatewayStatus.envManaged),
+        callbackUrl: gatewayStatus.callbackUrl || '',
         disabledReason: gatewayStatus.disabledReason || 'درگاه پرداخت اینترنتی هنوز متصل نشده است.'
       });
     }
@@ -70,12 +82,22 @@ export const AdminSettings: React.FC<AdminSettingsProps> = ({ gatewayStatus }) =
     setGwSuccess(null);
     setGwError(null);
     try {
-      const updated = await adminApi.updatePaymentGatewayStatus(gwStatus);
+      const payload: PaymentGatewayStatus = {
+        ...gwStatus,
+        merchantId: clearStoredMerchant && !gwStatus.configured
+          ? ''
+          : merchantIdInput.trim() || undefined
+      };
+      const updated = await adminApi.updatePaymentGatewayStatus(payload);
       setGwStatus(updated);
+      setMerchantIdInput('');
+      setClearStoredMerchant(false);
       setGwSuccess(
-        updated.configured
-          ? 'درگاه پرداخت با موفقیت متصل و فعال گردید. مشتریان اکنون امکان پرداخت آنلاین دارند.'
-          : 'وضعیت درگاه به «غیرفعال / قطع» تغییر یافت. تا زمان اتصال مجدد توسط مدیریت، هیچ پرداختی در سایت انجام نمی‌شود.'
+        updated.ready
+          ? 'درگاه پرداخت با موفقیت متصل و آماده دریافت پرداخت گردید.'
+          : updated.configured
+          ? 'تنظیمات درگاه ذخیره شد، اما به دلیل نقص کد مرچنت، درگاه هنوز آماده پذیرش پرداخت نیست.'
+          : 'وضعیت درگاه به «غیرفعال / قطع» تغییر یافت. تا زمان اتصال مجدد، پرداخت اینترنتی انجام نمی‌شود.'
       );
       loadAuditLogs();
     } catch (err: any) {
@@ -392,19 +414,19 @@ export const AdminSettings: React.FC<AdminSettingsProps> = ({ gatewayStatus }) =
           
           <div className="flex items-center gap-2">
             <span className={`px-3 py-1 rounded-full text-xs font-bold inline-flex items-center gap-1.5 ${
-              gwStatus.configured
+              gwStatus.ready
                 ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
                 : 'bg-rose-50 text-rose-700 border border-rose-200'
             }`}>
-              {gwStatus.configured ? (
+              {gwStatus.ready ? (
                 <>
                   <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>درگاه متصل و فعال است</span>
+                  <span>درگاه متصل و آماده است</span>
                 </>
               ) : (
                 <>
                   <AlertTriangle className="w-3.5 h-3.5" />
-                  <span>درگاه قطع است (پرداختی انجام نمی‌شود)</span>
+                  <span>درگاه قطع یا ناقص است (پرداختی انجام نمی‌شود)</span>
                 </>
               )}
             </span>
@@ -436,7 +458,7 @@ export const AdminSettings: React.FC<AdminSettingsProps> = ({ gatewayStatus }) =
 
           <div className="p-3.5 rounded-xl bg-[#E4F5FF]/30 border border-[#BFDDF0]">
             <span className="text-[#4A5560] block mb-1">وضعیت پذیرش پرداخت:</span>
-            {gwStatus.configured ? (
+            {gwStatus.ready ? (
               <span className="inline-flex items-center gap-1.5 font-bold text-[#2F6B4F]">
                 <CheckCircle2 className="w-4 h-4" />
                 <span>پذیرش فعال در صفحه تسویه حساب</span>
@@ -444,7 +466,7 @@ export const AdminSettings: React.FC<AdminSettingsProps> = ({ gatewayStatus }) =
             ) : (
               <span className="inline-flex items-center gap-1.5 font-bold text-[#A33A3A]">
                 <AlertTriangle className="w-4 h-4" />
-                <span>غیرفعال — پرداخت مسدود است</span>
+                <span>غیرفعال — پرداخت اینترنتی مسدود است</span>
               </span>
             )}
           </div>
@@ -454,6 +476,11 @@ export const AdminSettings: React.FC<AdminSettingsProps> = ({ gatewayStatus }) =
             <span className="font-semibold text-[#111110]">
               {gwStatus.mode === 'production' ? 'محیط تجاری اصلی (Production)' : 'محیط تستی / آزمایشی (Sandbox)'}
             </span>
+            {gwStatus.envManaged && (
+              <span className="block text-[10px] text-[#2B5876] mt-0.5">
+                مدیریت‌شده از طریق متغیرهای محیطی سرور (ENV)
+              </span>
+            )}
           </div>
         </div>
 
@@ -529,20 +556,61 @@ export const AdminSettings: React.FC<AdminSettingsProps> = ({ gatewayStatus }) =
 
             {/* Merchant ID / Terminal Key */}
             <div className="sm:col-span-2">
-              <label className="block font-semibold mb-1.5 text-[#111110]">
-                کد مرچنت (Merchant ID) / شناسه پایانه بانکی:
-              </label>
+              <div className="flex items-center justify-between mb-1.5">
+                <label className="block font-semibold text-[#111110]">
+                  کد مرچنت (Merchant ID) / شناسه پایانه زرین‌پال:
+                </label>
+                {gwStatus.hasMerchantId && (
+                  <span className="text-[11px] font-mono bg-[#E4F5FF] text-[#2B5876] px-2.5 py-0.5 rounded-lg border border-[#BFDDF0] dir-ltr">
+                    ثبت‌شده در سرور: {gwStatus.merchantIdMasked || '****'}
+                  </span>
+                )}
+              </div>
               <input
-                type="text"
-                value={gwStatus.merchantId || ''}
-                onChange={(e) => setGwStatus({ ...gwStatus, merchantId: e.target.value })}
-                placeholder="مثال: 7a2633f7-23ed-43ef-a1b1-82e24be0933e"
-                className="w-full px-3.5 py-2.5 rounded-xl border border-[#BFDDF0] bg-white focus:outline-none focus:border-[#111110] dir-ltr text-right font-mono"
+                type="password"
+                autoComplete="off"
+                disabled={Boolean(gwStatus.envManaged)}
+                value={merchantIdInput}
+                onChange={(e) => setMerchantIdInput(e.target.value)}
+                placeholder={
+                  gwStatus.envManaged
+                    ? 'کد مرچنت از طریق متغیر محیطی ZARINPAL_MERCHANT_ID روی سرور تنظیم شده است'
+                    : gwStatus.hasMerchantId
+                    ? `برای جایگزینی کد مرچنت فعلی (${gwStatus.merchantIdMasked || '****'}) مقدار جدید وارد کنید`
+                    : 'UUID ۳۶ کاراکتری مثال: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'
+                }
+                className="w-full px-3.5 py-2.5 rounded-xl border border-[#BFDDF0] bg-white focus:outline-none focus:border-[#111110] dir-ltr text-right font-mono disabled:bg-gray-100 disabled:text-gray-500"
               />
               <span className="text-[11px] text-gray-500 mt-1 block">
-                کد یکتای دریافت شده از ارائه‌دهنده درگاه پرداخت برای اتصال تراکنش‌ها
+                برای حفظ امنیت، کد مرچنت ذخیره‌شده هرگز به مرورگر ارسال نمی‌شود. در صورت خالی بودن این فیلد، کد قبلی حفظ می‌گردد.
               </span>
+              {!gwStatus.envManaged && gwStatus.hasMerchantId && !gwStatus.configured && (
+                <label className="mt-2 inline-flex items-center gap-2 text-[11px] text-[#A33A3A] cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={clearStoredMerchant}
+                    onChange={(e) => setClearStoredMerchant(e.target.checked)}
+                    className="rounded border-gray-300"
+                  />
+                  <span>حذف کد مرچنت ذخیره‌شده از سرور هنگام ذخیره</span>
+                </label>
+              )}
             </div>
+
+            {/* Callback URL Readonly */}
+            {gwStatus.callbackUrl && (
+              <div className="sm:col-span-2">
+                <label className="block font-semibold mb-1.5 text-[#111110]">
+                  نشانی بازگشت رسمی درگاه (Callback URL):
+                </label>
+                <input
+                  type="text"
+                  readOnly
+                  value={gwStatus.callbackUrl}
+                  className="w-full px-3.5 py-2 rounded-xl border border-[#BFDDF0] bg-gray-50 text-[#4A5560] dir-ltr text-left font-mono text-[11px]"
+                />
+              </div>
+            )}
 
             {/* Disabled Message */}
             <div className="sm:col-span-2">

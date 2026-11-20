@@ -65,7 +65,7 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
   };
 
   const handleStatusChange = async (newStatus: OrderStatus) => {
-    if (newStatus === 'CANCELED') {
+    if (newStatus === 'CANCELED' || newStatus === 'CANCELLED') {
       setIsConfirmingCancel(true);
       return;
     }
@@ -75,8 +75,8 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
 
   const handleConfirmCancel = async () => {
     setIsConfirmingCancel(false);
-    setSelectedStatus('CANCELED');
-    await onUpdateStatus(order.id, 'CANCELED');
+    setSelectedStatus('CANCELLED');
+    await onUpdateStatus(order.id, 'CANCELLED');
   };
 
   const handleDelete = async () => {
@@ -103,7 +103,12 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
       case 'PAYMENT_FAILED':
         return { label: 'خطا در پرداخت', bg: 'bg-[#A33A3A]/10 text-[#A33A3A] border-[#A33A3A]/30' };
       case 'CANCELED':
+      case 'CANCELLED':
         return { label: 'لغو شده', bg: 'bg-[#A33A3A]/15 text-[#A33A3A] border-[#A33A3A]/40' };
+      case 'RETURNED':
+        return { label: 'مرجوع شده', bg: 'bg-amber-50 text-amber-800 border-amber-300' };
+      case 'REFUNDED':
+        return { label: 'مسترد شده', bg: 'bg-amber-50 text-amber-800 border-amber-300' };
       default:
         return { label: status, bg: 'bg-gray-100 text-gray-800 border-gray-300' };
     }
@@ -186,7 +191,7 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
           </span>
           <div className="flex items-center gap-2">
             <select
-              value={order.status}
+              value={order.status === 'CANCELED' ? 'CANCELLED' : order.status}
               onChange={(e) => handleStatusChange(e.target.value as OrderStatus)}
               className="px-3 py-2 rounded-xl border border-[#BFDDF0] bg-white text-[#111110] font-medium focus:outline-none cursor-pointer"
             >
@@ -196,7 +201,9 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
               <option value="SHIPPED">ارسال شده (کد رهگیری پست)</option>
               <option value="DELIVERED">تحویل مشتری شد</option>
               <option value="PAYMENT_FAILED">خطا در تراکنش بانک</option>
-              <option value="CANCELED">لغو شده</option>
+              <option value="CANCELLED">لغو شده</option>
+              <option value="RETURNED">مرجوع شده</option>
+              <option value="REFUNDED">مسترد شده</option>
             </select>
           </div>
         </div>
@@ -670,9 +677,15 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
 
             <div className="space-y-1.5 text-[11px]">
               <div className="flex justify-between">
-                <span className="text-[#4A5560]">درگاه پرداخت:</span>
+                <span className="text-[#4A5560]">درگاه / روش پرداخت:</span>
                 <span className="font-semibold text-[#111110]">
-                  {order.paymentInfo?.gateway || 'زرین‌پال (ZarinPal IPG)'}
+                  {order.paymentInfo?.gateway || order.paymentMethod || '—'}
+                </span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-[#4A5560]">وضعیت تراکنش:</span>
+                <span className="font-mono font-semibold text-[#111110]">
+                  {order.paymentStatus || 'PENDING'}
                 </span>
               </div>
               <div className="flex justify-between">
@@ -683,16 +696,24 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
               </div>
               <div className="flex justify-between">
                 <span className="text-[#4A5560]">ماسک کارت خریدار:</span>
-                <span className="font-mono text-[#111110]">
-                  {order.paymentInfo?.cardPanMask || '۶۰۳۷-۹۹**-****-۲۲۴۵'}
+                <span className="font-mono text-[#111110] dir-ltr">
+                  {order.paymentInfo?.cardPanMask || '—'}
                 </span>
               </div>
               <div className="flex justify-between">
                 <span className="text-[#4A5560]">کد مرجع Authority:</span>
-                <span className="font-mono text-[10px] text-gray-500 truncate max-w-[180px]">
-                  {order.paymentInfo?.authority || 'A000000000000000000000000001'}
+                <span className="font-mono text-[10px] text-gray-500 truncate max-w-[180px]" title={order.paymentInfo?.authority || ''}>
+                  {order.paymentInfo?.authority || '—'}
                 </span>
               </div>
+              {Array.isArray(order.paymentAttempts) && order.paymentAttempts.length > 0 && (
+                <div className="flex justify-between">
+                  <span className="text-[#4A5560]">تعداد تلاش‌های پرداخت:</span>
+                  <span className="font-mono text-[#111110]">
+                    {formatPersianNumber(order.paymentAttempts.length)}
+                  </span>
+                </div>
+              )}
             </div>
           </div>
 

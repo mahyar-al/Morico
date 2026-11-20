@@ -55,11 +55,11 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
 
   // Today sales
   const todayPaidOrders = paidOrders.filter((o) => new Date(o.date).getTime() >= startOfToday);
-  const todaySales = todayPaidOrders.reduce((sum, o) => sum + o.total, 0);
+  const todaySales = todayPaidOrders.reduce((sum, o) => sum + (o.total ?? o.totalAmount ?? 0), 0);
 
   // This month (last 30 days) sales
   const monthPaidOrders = paidOrders.filter((o) => new Date(o.date).getTime() >= thirtyDaysAgo);
-  const monthSales = monthPaidOrders.reduce((sum, o) => sum + o.total, 0);
+  const monthSales = monthPaidOrders.reduce((sum, o) => sum + (o.total ?? o.totalAmount ?? 0), 0);
 
   // Orders waiting to be processed
   const waitingOrders = orders.filter((o) => o.status === 'PAID' || o.status === 'PROCESSING');
@@ -82,7 +82,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
   paidOrders.forEach((o) => {
     const dKey = o.date.slice(0, 10);
     if (dailyRevenueMap[dKey] !== undefined) {
-      dailyRevenueMap[dKey] += o.total;
+      dailyRevenueMap[dKey] += (o.total ?? o.totalAmount ?? 0);
     }
   });
 
@@ -96,7 +96,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
     SHIPPED: orders.filter((o) => o.status === 'SHIPPED').length,
     DELIVERED: orders.filter((o) => o.status === 'DELIVERED').length,
     PENDING_PAYMENT: orders.filter((o) => o.status === 'PENDING_PAYMENT').length,
-    CANCELED: orders.filter((o) => o.status === 'CANCELED').length
+    CANCELED: orders.filter((o) => o.status === 'CANCELED' || o.status === 'CANCELLED').length
   };
 
   // (C) Top 5 Selling Products by quantity from paid orders
@@ -609,7 +609,7 @@ export const AdminDashboard: React.FC<AdminDashboardProps> = ({
                       {ord.orderNumber || ord.id}
                     </div>
                     <div className="text-[11px] text-[#4A5560]">
-                      {ord.customerName} · {formatPrice(ord.total)}
+                      {ord.customerName} · {formatPrice(ord.total ?? ord.totalAmount ?? 0)}
                     </div>
                   </div>
                   <span className="text-[10px] px-2 py-0.5 rounded-full font-medium bg-[#111110] text-white">

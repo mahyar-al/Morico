@@ -35,8 +35,14 @@ export interface AuditLogEntry {
     | 'ORDER_STATUS_CHANGED'
     | 'ORDER_PRICE_TAMPERING_ATTEMPT'
     | 'MALICIOUS_UPLOAD_BLOCKED'
+    | 'PAYMENT_REQUEST_CREATED'
+    | 'PAYMENT_REQUEST_FAILED'
+    | 'PAYMENT_CALLBACK_RECEIVED'
     | 'PAYMENT_VERIFICATION_SUCCESS'
     | 'PAYMENT_VERIFICATION_FAILED'
+    | 'PAYMENT_VERIFY_AMBIGUOUS'
+    | 'PAYMENT_DUPLICATE_BLOCKED'
+    | 'INVENTORY_DECREMENTED'
     | 'CATALOG_MUTATION'
     | 'SETTINGS_MUTATION';
   username?: string;
@@ -111,9 +117,10 @@ export function recordAuditLog(entry: Omit<AuditLogEntry, 'id' | 'timestamp' | '
   const timestamp = new Date().toISOString();
   const prevHash = lastAuditHash;
 
-  // Mask sensitive values (PII Redaction)
-  let sanitizedDetails = entry.details;
+  // Mask sensitive values (PII, full PAN, merchant UUIDs)
+  let sanitizedDetails = String(entry.details || '');
   sanitizedDetails = sanitizedDetails.replace(/(\d{4})[- ]?(\d{4})[- ]?(\d{4})[- ]?(\d{4})/g, '$1-****-****-$4');
+  sanitizedDetails = sanitizedDetails.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi, '****-****-****-****');
 
   // Compute cryptographic hash of the entry chained to the previous hash
   const payloadToHash = `${id}|${timestamp}|${entry.event}|${entry.username || ''}|${entry.ip}|${sanitizedDetails}|${prevHash}`;

@@ -10,7 +10,9 @@ import {
   SiteContent,
   OrderStatus,
   BestSellerItem,
-  TopWeeklyItem
+  TopWeeklyItem,
+  PaymentRequestResponse,
+  PaymentVerifyResponse
 } from './types';
 import {
   DEFAULT_BEST_SELLER_ITEMS,
@@ -141,8 +143,11 @@ async function adminFetch<T>(
     headers.set('Authorization', `Bearer ${token}`);
   }
 
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+
   try {
-    const res = await fetch(url, { ...options, headers });
+    const res = await fetch(url, { ...options, headers, signal: controller.signal });
 
     if (res.status === 401) {
       triggerAuthError('نشست کاری شما منقضی شده است یا دسترسی غیرمجاز است. لطفاً دوباره وارد شوید.');
@@ -172,17 +177,56 @@ async function adminFetch<T>(
     }
   } catch (err: any) {
     if (err instanceof AdminApiError) throw err;
+    if (err?.name === 'AbortError') {
+      throw new AdminApiError('زمان پاسخ‌گویی سرور به پایان رسید. لطفاً مجدداً تلاش نمایید.', 504);
+    }
     // Network offline fallback only if provided and not an auth error
     if (fallbackFn) {
       return await fallbackFn();
     }
-    throw new AdminApiError('ارتباط با سرور برقرار نشد: ' + err.message, 500);
+    throw new AdminApiError('ارتباط با سرور برقرار نشد: ' + (err?.message || ''), 500);
+  } finally {
+    clearTimeout(timeoutId);
   }
 
   if (fallbackFn) {
     return await fallbackFn();
   }
   throw new AdminApiError('پاسخ نامعتبر از سرور', 500);
+}
+
+async function paymentFetch<T>(url: string, options: RequestInit = {}): Promise<T> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 15000);
+  try {
+    const headers = new Headers(options.headers || {});
+    if (!headers.has('Content-Type')) {
+      headers.set('Content-Type', 'application/json');
+    }
+    const res = await fetch(url, {
+      credentials: 'include',
+      ...options,
+      headers,
+      signal: controller.signal
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new AdminApiError(
+        data.error || data.message || `خطای سرور (${res.status})`,
+        res.status,
+        data.error
+      );
+    }
+    return data as T;
+  } catch (err: any) {
+    if (err instanceof AdminApiError) throw err;
+    if (err?.name === 'AbortError') {
+      throw new AdminApiError('زمان اتصال به سرور پرداخت به پایان رسید. لطفاً چند لحظه دیگر بررسی کنید.', 504);
+    }
+    throw new AdminApiError('خطا در برقراری ارتباط با سرور: ' + (err?.message || ''), 500);
+  } finally {
+    clearTimeout(timeoutId);
+  }
 }
 
 // -------------------------------------------------------------
@@ -715,20 +759,84 @@ export const adminApi = {
     );
   },
 
-  // 9. Payment Gateway Status
+  // 9. Payment Gateway Status & Real ZarinPal Payment Flow
   async getPaymentGatewayStatus(): Promise<PaymentGatewayStatus> {
-    return await adminFetch('/api/payments/status', {}, () => {
-      return getStored('morico_gateway_status', INITIAL_GATEWAY);
-    });
+    try {
+      return await paymentFetch<PaymentGatewayStatus>('/api/payments/status', { method: 'GET' });
+    } catch {
+      return INITIAL_GATEWAY;
+    }
+  },
+
+  async getAdminPaymentGatewayStatus(): Promise<PaymentGatewayStatus> {
+    return await adminFetch<PaymentGatewayStatus>('/api/admin/payments/gateway', { method: 'GET' });
   },
 
   async updatePaymentGatewayStatus(status: PaymentGatewayStatus): Promise<PaymentGatewayStatus> {
-    return await adminFetch(
-      '/api/admin/payments/gateway',
-      { method: 'PUT', body: JSON.stringify(status) },
-      () => {
-        setStored('morico_gateway_status', status);
-        return status;
+    return await adminFetch<PaymentGatewayStatus>('/api/admin/payments/gateway', {
+      method: 'PUT',
+      body: JSON.stringify(status)
+    });
+  },
+
+  async createOrder(orderPayload: Record<string, any>): Promise<Order & { paymentToken?: string }> {
+    return await paymentFetch<Order & { paymentToken?: string }>('/api/orders', {
+      method: 'POST',
+      body: JSON.stringify(orderPayload)
+    });
+  },
+
+  async requestZarinPalPayment(payload: {
+    orderNumber: string;
+    orderId?: string;
+    idempotencyKey?: string;
+    paymentToken?: string;
+    phone?: string;
+  }): Promise<PaymentRequestResponse> {
+    const headers: Record<string, string> = {};
+    if (payload.paymentToken) {
+      headers['X-Payment-Token'] = payload.paymentToken;
+    }
+    return await paymentFetch<PaymentRequestResponse>('/api/payments/zarinpal/request', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async verifyZarinPalPayment(payload: {
+    authority: string;
+    orderNumber: string;
+    orderId?: string;
+    paymentToken?: string;
+    phone?: string;
+  }): Promise<PaymentVerifyResponse> {
+    const headers: Record<string, string> = {};
+    if (payload.paymentToken) {
+      headers['X-Payment-Token'] = payload.paymentToken;
+    }
+    return await paymentFetch<PaymentVerifyResponse>('/api/payments/zarinpal/verify', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify(payload)
+    });
+  },
+
+  async getPaymentResult(
+    orderNumber: string,
+    paymentToken?: string,
+    phone?: string
+  ): Promise<{ success: boolean; order: Order }> {
+    const headers: Record<string, string> = {};
+    if (paymentToken) {
+      headers['X-Payment-Token'] = paymentToken;
+    }
+    const qs = phone ? `?phone=${encodeURIComponent(phone)}` : '';
+    return await paymentFetch<{ success: boolean; order: Order }>(
+      `/api/payments/orders/${encodeURIComponent(orderNumber)}/result${qs}`,
+      {
+        method: 'GET',
+        headers
       }
     );
   },

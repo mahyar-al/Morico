@@ -11,7 +11,8 @@
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit",
-    "test:security": "NODE_ENV=test tsx scripts/test-security.ts"
+    "test:security": "NODE_ENV=test tsx scripts/test-security.ts",
+    "test:payment": "NODE_ENV=test tsx scripts/test-payment.ts"
   },
   "dependencies": {
     "@fontsource/cormorant-garamond": "^5.3.0",

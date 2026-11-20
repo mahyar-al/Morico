@@ -389,11 +389,11 @@ export function getActiveLockoutsCount(): number {
 // Express Rate Limiters (100% Backed by Distributed Cache / redisStore)
 // --------------------------------------------------------------------------
 
-export function createGeneralRateLimiter(maxRequests = 300, windowMs = 60000) {
+export function createGeneralRateLimiter(maxRequests = 300, windowMs = 60000, keyPrefix = 'rate_limit_gen') {
   const windowSec = Math.ceil(windowMs / 1000);
   return async (req: Request, res: Response, next: NextFunction) => {
     const ip = req.ip || '127.0.0.1';
-    const count = await cacheIncr(`rate_limit_gen:${ip}`, windowSec);
+    const count = await cacheIncr(`${keyPrefix}:${ip}`, windowSec);
     if (count > maxRequests) {
       return res.status(429).json({
         error: 'تعداد درخواست‌ها بیش از حد مجاز است. لطفاً اندکی صبر فرمایید.'

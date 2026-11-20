@@ -148,9 +148,12 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   const [siteContent, setSiteContent] = useState<SiteContent | null>(null);
   const [gatewayStatus, setGatewayStatus] = useState<PaymentGatewayStatus>({
     gatewayName: 'زرین‌پال (ZarinPal IPG)',
-    configured: true,
-    mode: 'production',
-    merchantId: '7a2633f7-23ed-43ef-a1b1-82e24be0933e'
+    configured: false,
+    ready: false,
+    mode: 'sandbox',
+    merchantId: '',
+    hasMerchantId: false,
+    merchantIdMasked: ''
   });
 
   // 6. Polling & New Orders Notification
@@ -241,10 +244,14 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
         adminApi.getTopWeekly().catch(() => []),
         adminApi.getUsers().catch(() => []),
         adminApi.getSiteContent().catch(() => null),
-        adminApi.getPaymentGatewayStatus().catch(() => ({
-          gatewayName: 'زرین‌پال',
-          configured: true,
-          mode: 'production' as const
+        adminApi.getAdminPaymentGatewayStatus().catch(() => ({
+          gatewayName: 'زرین‌پال (ZarinPal IPG)',
+          configured: false,
+          ready: false,
+          mode: 'sandbox' as const,
+          merchantId: '',
+          hasMerchantId: false,
+          merchantIdMasked: ''
         }))
       ]);
 

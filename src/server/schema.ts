@@ -10,19 +10,37 @@ export type OrderStatus =
   | 'PROCESSING'
   | 'SHIPPED'
   | 'DELIVERED'
+  | 'PAYMENT_FAILED'
   | 'CANCELLED'
-  | 'RETURNED';
+  | 'CANCELED'
+  | 'RETURNED'
+  | 'REFUNDED';
 
 // Strict state machine transitions for orders
 const ORDER_STATE_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
-  PENDING_PAYMENT: ['PAID', 'CANCELLED'],
-  PAID: ['PROCESSING', 'CANCELLED'],
-  PROCESSING: ['SHIPPED', 'CANCELLED'],
+  PENDING_PAYMENT: ['PAID', 'PAYMENT_FAILED', 'CANCELLED', 'CANCELED'],
+  PAYMENT_FAILED: ['PENDING_PAYMENT', 'PAID', 'CANCELLED', 'CANCELED'],
+  PAID: ['PROCESSING', 'CANCELLED', 'CANCELED', 'REFUNDED'],
+  PROCESSING: ['SHIPPED', 'CANCELLED', 'CANCELED'],
   SHIPPED: ['DELIVERED', 'RETURNED'],
   DELIVERED: [], // Terminal state
   CANCELLED: [], // Terminal state
-  RETURNED: []   // Terminal state
+  CANCELED: [],  // Terminal state
+  RETURNED: [],  // Terminal state
+  REFUNDED: []   // Terminal state
 };
+
+export function isTerminalOrderStatus(status: string): boolean {
+  return ['DELIVERED', 'CANCELLED', 'CANCELED', 'RETURNED', 'REFUNDED'].includes(status);
+}
+
+export function isCancelledOrderStatus(status: string): boolean {
+  return status === 'CANCELLED' || status === 'CANCELED';
+}
+
+export function isPaidOrFulfilledOrderStatus(status: string): boolean {
+  return ['PAID', 'PROCESSING', 'SHIPPED', 'DELIVERED'].includes(status);
+}
 
 export function isValidOrderStatus(status: string): status is OrderStatus {
   return [
@@ -31,8 +49,11 @@ export function isValidOrderStatus(status: string): status is OrderStatus {
     'PROCESSING',
     'SHIPPED',
     'DELIVERED',
+    'PAYMENT_FAILED',
     'CANCELLED',
-    'RETURNED'
+    'CANCELED',
+    'RETURNED',
+    'REFUNDED'
   ].includes(status);
 }
 
@@ -57,15 +78,22 @@ export function sanitizeOrderInput(body: any): {
   customerNotes?: string;
   paymentMethod: 'gateway' | 'card';
   promoCode?: string;
+  idempotencyKey?: string;
   items: Array<{
     productId: string;
+    selectedVariantId?: string;
     selectedColor?: string;
     selectedSize?: string;
     quantity: number;
     customization?: {
       customFee?: number;
       elements?: any[];
+      layers?: any[];
+      views?: Record<string, any>;
       mockupView?: string;
+      viewName?: string;
+      designImageUrl?: string;
+      previewMockupUrl?: string;
     };
   }>;
 } | { error: string } {
@@ -95,10 +123,13 @@ export function sanitizeOrderInput(body: any): {
   const customerEmail = body.customerEmail ? sanitizeText(body.customerEmail, 80) : undefined;
   const customerNotes = body.customerNotes ? sanitizeText(body.customerNotes, 300) : undefined;
   const promoCode = body.promoCode || body.appliedCode ? String(body.promoCode || body.appliedCode).trim().toUpperCase() : undefined;
+  const idempotencyKey = typeof body.idempotencyKey === 'string' && body.idempotencyKey.trim()
+    ? sanitizeText(body.idempotencyKey.trim(), 100)
+    : undefined;
 
   const paymentMethod =
     body.paymentMethod === 'gateway' ||
-    (typeof body.paymentMethod === 'string' && body.paymentMethod.includes('درگاه'))
+    (typeof body.paymentMethod === 'string' && (body.paymentMethod.includes('درگاه') || body.paymentMethod.toLowerCase().includes('zarinpal')))
       ? 'gateway'
       : 'card';
 
@@ -119,11 +150,13 @@ export function sanitizeOrderInput(body: any): {
     if (!productId) {
       return { error: 'شناسه محصول الزامی است.' };
     }
-    const quantity = Math.floor(Number(it.quantity) || 1);
-    if (quantity < 1 || quantity > 20) {
-      return { error: 'تعداد هر محصول باید بین ۱ تا ۲۰ عدد باشد.' };
+    const rawQty = Number(it.quantity);
+    if (!Number.isFinite(rawQty) || rawQty < 1 || rawQty > 20 || Math.floor(rawQty) !== rawQty) {
+      return { error: 'تعداد هر محصول باید یک عدد صحیح بین ۱ تا ۲۰ عدد باشد.' };
     }
+    const quantity = Math.floor(rawQty);
 
+    const selectedVariantId = it.selectedVariantId ? sanitizeText(it.selectedVariantId, 60) : undefined;
     const selectedColor = it.selectedColor ? sanitizeText(it.selectedColor, 40) : undefined;
     const selectedSize = it.selectedSize ? sanitizeText(it.selectedSize, 30) : undefined;
 
@@ -133,12 +166,18 @@ export function sanitizeOrderInput(body: any): {
       customization = {
         customFee: Math.max(0, Math.min(500000, rawFee)),
         elements: Array.isArray(it.customization.elements) ? it.customization.elements.slice(0, 20) : [],
-        mockupView: sanitizeText(it.customization.mockupView || '', 30)
+        layers: Array.isArray(it.customization.layers) ? it.customization.layers.slice(0, 20) : undefined,
+        views: it.customization.views && typeof it.customization.views === 'object' ? it.customization.views : undefined,
+        mockupView: sanitizeText(it.customization.mockupView || '', 30),
+        viewName: sanitizeText(it.customization.viewName || '', 40),
+        designImageUrl: typeof it.customization.designImageUrl === 'string' ? it.customization.designImageUrl.slice(0, 500000) : undefined,
+        previewMockupUrl: typeof it.customization.previewMockupUrl === 'string' ? it.customization.previewMockupUrl.slice(0, 500000) : undefined
       };
     }
 
     validatedItems.push({
       productId,
+      selectedVariantId,
       quantity,
       selectedColor,
       selectedSize,
@@ -157,6 +196,7 @@ export function sanitizeOrderInput(body: any): {
     customerNotes,
     paymentMethod,
     promoCode,
+    idempotencyKey,
     items: validatedItems
   };
 }

@@ -1,7 +1,8 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { CartItem, Order, User, Product, PaymentGatewayStatus } from '../lib/types';
 import { formatPrice, formatPersianNumber, formatPersianPhone } from '../lib/currency';
-import { calculateCartTotals, SHIPPING_THRESHOLD } from '../lib/cartUtils';
+import { formatJalaliDateTime } from '../lib/dateUtils';
+import { calculateCartTotals } from '../lib/cartUtils';
 import { adminApi } from '../lib/adminApi';
 import {
   X,
@@ -15,13 +16,22 @@ import {
   AlertTriangle,
   User as UserIcon,
   MapPin,
-  Package,
-  Truck,
-  FileText,
   Building,
-  Sparkles
+  Loader2,
+  RefreshCw,
+  Clock,
+  XCircle
 } from 'lucide-react';
 import { LocationPickerModal, LocationData } from './LocationPickerModal';
+
+export interface PaymentCallbackResult {
+  type: 'success' | 'failed' | 'cancelled' | 'pending_verify';
+  orderNumber?: string;
+  reason?: string;
+  message?: string;
+  order?: Order | null;
+  loading?: boolean;
+}
 
 interface CheckoutModalProps {
   isOpen: boolean;
@@ -33,6 +43,10 @@ interface CheckoutModalProps {
   currentUser: User | null;
   onOrderSuccess: (order: Order) => void;
   onNavigateToTracking?: () => void;
+  callbackResult?: PaymentCallbackResult | null;
+  onClearCallbackResult?: () => void;
+  onReverifyCallbackOrder?: (order: Order) => Promise<void>;
+  onRetryCallbackOrder?: (order: Order) => Promise<void>;
 }
 
 const IRAN_PROVINCES = [
@@ -54,6 +68,13 @@ const IRAN_PROVINCES = [
   'سایر استان‌ها'
 ];
 
+function createClientIdempotencyKey(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `idem-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
 export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   isOpen,
   onClose,
@@ -63,7 +84,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   appliedCode,
   currentUser,
   onOrderSuccess,
-  onNavigateToTracking
+  onNavigateToTracking,
+  callbackResult,
+  onClearCallbackResult,
+  onReverifyCallbackOrder,
+  onRetryCallbackOrder
 }) => {
   // Step tracker: 1 = Review, 2 = Customer Info & Address, 3 = Payment & Confirmation
   const [step, setStep] = useState<1 | 2 | 3>(1);
@@ -89,25 +114,48 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     if (loc.postalCode) setPostalCode(loc.postalCode);
   };
 
-  // Form Validation & Errors
+  // Form Validation & Inline Submission Feedback
   const [errors, setErrors] = useState<{ [key: string]: string }>({});
+  const [submitError, setSubmitError] = useState<string | null>(null);
 
-  // Submission State
+  // Submission & Payment State
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [paymentPhase, setPaymentPhase] = useState<'idle' | 'creating_order' | 'connecting_gateway' | 'redirecting'>('idle');
+  const [createdPendingOrder, setCreatedPendingOrder] = useState<(Order & { paymentToken?: string }) | null>(null);
   const [completedOrder, setCompletedOrder] = useState<Order | null>(null);
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
+  const [isCallbackActionBusy, setIsCallbackActionBusy] = useState(false);
 
-  // Gateway Status
+  const submitLockRef = useRef(false);
+  const idempotencyKeyRef = useRef<string>(createClientIdempotencyKey());
+
+  // Gateway Status (refreshed every time checkout opens)
   const [gatewayStatus, setGatewayStatus] = useState<PaymentGatewayStatus | null>(null);
+  const [isGatewayLoading, setIsGatewayLoading] = useState(false);
 
   useEffect(() => {
-    adminApi.getPaymentGatewayStatus().then((status) => {
-      setGatewayStatus(status);
-      if (!status?.configured) {
-        setPaymentMethod('card');
-      }
-    });
-  }, []);
+    if (!isOpen) return;
+    setIsGatewayLoading(true);
+    adminApi
+      .getPaymentGatewayStatus()
+      .then((status) => {
+        setGatewayStatus(status);
+        const isReady = Boolean(status?.ready ?? status?.configured);
+        if (!isReady) {
+          setPaymentMethod('card');
+        }
+      })
+      .finally(() => {
+        setIsGatewayLoading(false);
+      });
+  }, [isOpen]);
+
+  // Reset transient pending order / idempotency key if cart changes before submission
+  useEffect(() => {
+    idempotencyKeyRef.current = createClientIdempotencyKey();
+    setCreatedPendingOrder(null);
+    setSubmitError(null);
+  }, [cart.length, discountAmount, appliedCode]);
 
   // Save fields to draft
   useEffect(() => {
@@ -124,9 +172,21 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
   if (!isOpen) return null;
 
+  const isGatewayReady = Boolean(gatewayStatus?.ready ?? gatewayStatus?.configured);
+
   // Calculate live totals
   const promoDummy = appliedCode ? { code: appliedCode, amount: discountAmount, active: true, id: 'temp' } : null;
   const totals = calculateCartTotals(cart, promoDummy as any, products);
+
+  const handleCloseModal = () => {
+    if (callbackResult && onClearCallbackResult) {
+      onClearCallbackResult();
+    }
+    setCompletedOrder(null);
+    setSubmitError(null);
+    setPaymentPhase('idle');
+    onClose();
+  };
 
   // Validate Step 2 inputs
   const validateStep2 = () => {
@@ -153,6 +213,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
   };
 
   const handleNextStep = () => {
+    setSubmitError(null);
     if (step === 1) {
       setStep(2);
     } else if (step === 2) {
@@ -162,10 +223,14 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     }
   };
 
-  const handleFinalSubmit = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const handleFinalSubmit = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (submitLockRef.current || isSubmitting) return;
+
+    setSubmitError(null);
+
     if (totals.hasOutOfStock) {
-      alert('برخی از محصولات سبد ناموجود شده‌اند. لطفاً ابتدا آن‌ها را از سبد حذف کنید.');
+      setSubmitError('برخی از محصولات سبد ناموجود شده‌اند. لطفاً ابتدا آن‌ها را از سبد خرید حذف کنید.');
       return;
     }
     if (!validateStep2()) {
@@ -173,71 +238,85 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
       return;
     }
 
-    if (paymentMethod === 'gateway' && !gatewayStatus?.configured) {
-      alert('درگاه پرداخت اینترنتی هنوز متصل نشده است. تا زمان اتصال درگاه توسط مدیریت فروشگاه، پرداختی انجام نمی‌شود.');
+    if (paymentMethod === 'gateway' && !isGatewayReady) {
+      setSubmitError(
+        gatewayStatus?.disabledReason ||
+          'درگاه پرداخت اینترنتی هنوز متصل نشده است. تا زمان اتصال درگاه توسط مدیریت فروشگاه، پرداخت آنلاین انجام نمی‌شود.'
+      );
       return;
     }
 
+    submitLockRef.current = true;
     setIsSubmitting(true);
 
     try {
-      const orderPayload = {
-        customerName: name.trim(),
-        customerPhone: phone.trim(),
-        customerEmail: email.trim() || undefined,
-        customerAddress: address.trim(),
-        customerPostal: postalCode.trim() || '۱۱۹۳۶۵۴۳۲۱',
-        postalCode: postalCode.trim() || '۱۱۹۳۶۵۴۳۲۱',
-        province: province.trim(),
-        customerProvince: province.trim(),
-        city: city.trim(),
-        customerCity: city.trim(),
-        customerNotes: notes.trim() || undefined,
-        items: [...cart],
-        subtotal: totals.subtotalAfterProductDiscount,
-        discount: totals.promoDiscount,
-        discountAmount: totals.promoDiscount,
-        promoCode: appliedCode || undefined,
-        shipping: totals.shippingFee,
-        shippingFee: totals.shippingFee,
-        total: totals.finalTotal,
-        totalAmount: totals.finalTotal,
-        status: (paymentMethod === 'gateway' ? 'PAID' : 'PENDING_PAYMENT') as Order['status'],
-        paymentStatus: paymentMethod === 'gateway' ? 'PAID' : 'PENDING',
-        paymentMethod:
-          paymentMethod === 'gateway'
-            ? 'درگاه پرداخت شاپرک / زرین‌پال'
-            : 'کارت به کارت / حساب رسمی آتلیه',
-        paymentInfo: {
-          gateway: gatewayStatus?.gatewayName || 'زرین‌پال (ZarinPal IPG)',
-          refId: Math.floor(100000000 + Math.random() * 900000000).toString(),
-          cardPanMask: '۶۰۳۷-۹۹**-****-۲۲۴۵',
-          paidAt: new Date().toISOString()
-        }
-      };
+      let pendingOrder = createdPendingOrder;
 
-      const res = await fetch('/api/orders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(orderPayload)
-      });
+      if (!pendingOrder) {
+        setPaymentPhase('creating_order');
+        const orderPayload = {
+          customerName: name.trim(),
+          customerPhone: phone.trim(),
+          customerEmail: email.trim() || undefined,
+          customerAddress: address.trim(),
+          postalCode: postalCode.trim() || '۱۱۹۳۶۵۴۳۲۱',
+          province: province.trim(),
+          city: city.trim(),
+          customerNotes: notes.trim() || undefined,
+          items: cart.map((item) => ({
+            productId: item.product.id,
+            selectedVariantId: item.selectedVariantId,
+            selectedColor: item.selectedColor,
+            selectedSize: item.selectedSize,
+            quantity: item.quantity,
+            customization: item.customization
+          })),
+          promoCode: appliedCode || undefined,
+          total: totals.finalTotal,
+          totalAmount: totals.finalTotal,
+          paymentMethod,
+          idempotencyKey: idempotencyKeyRef.current
+        };
 
-      let finalOrder: Order;
-      if (res.ok) {
-        finalOrder = await res.json();
-      } else {
-        const errData = await res.json().catch(() => ({}));
-        alert(errData.error || 'خطا در ثبت سفارش. لطفاً اطلاعات ارسالی را بررسی فرمایید.');
-        setIsSubmitting(false);
+        pendingOrder = await adminApi.createOrder(orderPayload);
+        setCreatedPendingOrder(pendingOrder);
+      }
+
+      if (paymentMethod === 'card') {
+        onOrderSuccess(pendingOrder);
+        setCompletedOrder(pendingOrder);
         return;
       }
 
-      onOrderSuccess(finalOrder);
-      setCompletedOrder(finalOrder);
+      // Gateway flow: persist pending payment token across browser redirect to ZarinPal
+      try {
+        sessionStorage.setItem(
+          'morico_pending_payment',
+          JSON.stringify({
+            orderNumber: pendingOrder.orderNumber,
+            paymentToken: pendingOrder.paymentToken,
+            phone: phone.trim()
+          })
+        );
+      } catch {}
+
+      setPaymentPhase('connecting_gateway');
+      const paymentReq = await adminApi.requestZarinPalPayment({
+        orderNumber: pendingOrder.orderNumber,
+        orderId: pendingOrder.id,
+        idempotencyKey: `${idempotencyKeyRef.current}-pay`,
+        paymentToken: pendingOrder.paymentToken,
+        phone: phone.trim()
+      });
+
+      setPaymentPhase('redirecting');
+      window.location.assign(paymentReq.paymentUrl);
     } catch (err: any) {
-      alert('خطا در برقراری ارتباط با سرور: ' + (err.message || ''));
+      setSubmitError(err?.message || 'خطا در برقراری ارتباط با سرور پرداخت. لطفاً مجدداً تلاش کنید.');
+      setPaymentPhase('idle');
     } finally {
       setIsSubmitting(false);
+      submitLockRef.current = false;
     }
   };
 
@@ -247,10 +326,301 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
     setTimeout(() => setCopiedKey(null), 2000);
   };
 
+  const renderPaidOrCardReceipt = (order: Order, isPaid: boolean) => (
+    <div className="text-center py-4 space-y-6">
+      <div
+        className={`w-16 h-16 rounded-2xl flex items-center justify-center mx-auto shadow-sm ${
+          isPaid ? 'bg-green-100 text-[#2F6B4F]' : 'bg-amber-100 text-amber-700'
+        }`}
+      >
+        {isPaid ? <CheckCircle2 className="w-10 h-10" /> : <Clock className="w-10 h-10" />}
+      </div>
+
+      <div className="space-y-1.5">
+        <span
+          className={`inline-block px-3 py-1 rounded-full text-[11px] font-bold mb-1 ${
+            isPaid ? 'bg-emerald-50 text-[#2F6B4F] border border-emerald-200' : 'bg-amber-50 text-amber-800 border border-amber-200'
+          }`}
+        >
+          {isPaid ? 'پرداخت آنلاین تایید شده (PAID)' : 'ثبت اولیه — در انتظار پرداخت و تایید واریز'}
+        </span>
+        <h3 className="text-xl sm:text-2xl font-bold text-[#111110]">
+          {isPaid ? 'پرداخت شما با موفقیت در زرین‌پال تایید شد' : 'سفارش کارت به کارت شما با موفقیت ثبت گردید'}
+        </h3>
+        <p className="text-xs text-[#4A5560] max-w-md mx-auto leading-relaxed">
+          {isPaid
+            ? 'تراکنش بانکی شما با موفقیت راستی‌آزمایی شد و سفارش وارد صف آماده‌سازی و ارسال آتلیه MORICO گردید.'
+            : 'جهت تکمیل سفارش، لطفاً مبلغ زیر را به حساب رسمی آتلیه واریز نمایید تا پس از تایید مدیریت، مراحل ارسال آغاز شود.'}
+        </p>
+      </div>
+
+      {!isPaid && (
+        <div className="p-4 rounded-2xl bg-amber-50/70 border border-amber-200 max-w-lg mx-auto text-right space-y-2 text-xs">
+          <div className="font-bold text-amber-900 flex items-center gap-1.5">
+            <Building className="w-4 h-4 text-amber-700" />
+            <span>راهنمای واریز کارت به کارت آتلیه MORICO</span>
+          </div>
+          <p className="text-[11px] text-amber-900 leading-relaxed">
+            پس از واریز مبلغ فاکتور، شماره سفارش <strong className="font-mono">{order.orderNumber}</strong> را جهت تایید سریع به پشتیبانی آتلیه ({formatPersianPhone('02122089410')}) اعلام فرمایید.
+          </p>
+        </div>
+      )}
+
+      {/* Order Metadata Box */}
+      <div className="p-4 sm:p-5 rounded-2xl bg-[#E4F5FF]/50 border border-[#BFDDF0] max-w-lg mx-auto space-y-3 text-xs text-right">
+        {/* Order Number */}
+        <div className="flex justify-between items-center pb-2.5 border-b border-[#BFDDF0]/60">
+          <span className="text-[#4A5560]">شماره فاکتور / سفارش:</span>
+          <div className="flex items-center gap-1.5 font-bold font-mono text-sm text-[#111110]">
+            <span>{order.orderNumber}</span>
+            <button
+              type="button"
+              onClick={() => handleCopy(order.orderNumber, 'num')}
+              className="p-1 hover:text-black text-gray-500 cursor-pointer"
+              title="کپی شماره سفارش"
+            >
+              {copiedKey === 'num' ? <Check className="w-3.5 h-3.5 text-[#2F6B4F]" /> : <Copy className="w-3.5 h-3.5" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Tracking Code */}
+        <div className="flex justify-between items-center pb-2.5 border-b border-[#BFDDF0]/60">
+          <span className="text-[#4A5560]">کد رهگیری سفارش:</span>
+          <div className="flex items-center gap-1.5 font-bold font-mono text-[#2F6B4F]">
+            <span>{order.trackingCode}</span>
+            <button
+              type="button"
+              onClick={() => handleCopy(order.trackingCode, 'trk')}
+              className="p-1 hover:text-black text-gray-500 cursor-pointer"
+              title="کپی کد رهگیری"
+            >
+              {copiedKey === 'trk' ? <Check className="w-3.5 h-3.5 text-[#2F6B4F]" /> : <Copy className="w-3.5 h-3.5" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Real ZarinPal RefID when paid */}
+        {isPaid && order.paymentInfo?.refId && (
+          <div className="flex justify-between items-center pb-2.5 border-b border-[#BFDDF0]/60">
+            <span className="text-[#4A5560]">شناسه پیگیری بانکی (RefID):</span>
+            <div className="flex items-center gap-1.5 font-bold font-mono text-[#2F6B4F]">
+              <span>{order.paymentInfo.refId}</span>
+              <button
+                type="button"
+                onClick={() => handleCopy(String(order.paymentInfo?.refId || ''), 'ref')}
+                className="p-1 hover:text-black text-gray-500 cursor-pointer"
+                title="کپی شماره پیگیری بانکی"
+              >
+                {copiedKey === 'ref' ? <Check className="w-3.5 h-3.5 text-[#2F6B4F]" /> : <Copy className="w-3.5 h-3.5" />}
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Masked Card PAN when returned by ZarinPal */}
+        {isPaid && order.paymentInfo?.cardPanMask && (
+          <div className="flex justify-between items-center pb-2.5 border-b border-[#BFDDF0]/60">
+            <span className="text-[#4A5560]">شماره کارت پرداخت‌کننده:</span>
+            <span className="font-mono font-semibold text-[#111110] dir-ltr">{order.paymentInfo.cardPanMask}</span>
+          </div>
+        )}
+
+        {/* Payment Timestamp */}
+        {isPaid && (order.paidAt || order.paymentInfo?.paidAt) && (
+          <div className="flex justify-between items-center pb-2.5 border-b border-[#BFDDF0]/60">
+            <span className="text-[#4A5560]">زمان تایید تراکنش:</span>
+            <span className="font-medium text-[#111110]">
+              {formatJalaliDateTime(order.paidAt || order.paymentInfo?.paidAt)}
+            </span>
+          </div>
+        )}
+
+        {/* Customer */}
+        <div className="flex justify-between items-center pb-2.5 border-b border-[#BFDDF0]/60">
+          <span className="text-[#4A5560]">تحویل‌گیرنده:</span>
+          <span className="font-semibold text-[#111110]">
+            {order.customerName} ({formatPersianPhone(order.customerPhone)})
+          </span>
+        </div>
+
+        {/* Address */}
+        <div className="flex justify-between items-start pb-2.5 border-b border-[#BFDDF0]/60">
+          <span className="text-[#4A5560] shrink-0">نشانی ارسال:</span>
+          <span className="font-medium text-[#111110] text-left max-w-xs">{order.customerAddress}</span>
+        </div>
+
+        {/* Amount */}
+        <div className="flex justify-between items-center pt-1">
+          <span className="text-[#4A5560] font-semibold">
+            {isPaid ? 'مبلغ پرداخت شده:' : 'مبلغ قابل واریز:'}
+          </span>
+          <span className="font-bold text-base text-[#111110]">{formatPrice(order.totalAmount)}</span>
+        </div>
+      </div>
+
+      {/* Actions */}
+      <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+        <button
+          type="button"
+          onClick={() => {
+            handleCloseModal();
+            if (onNavigateToTracking) onNavigateToTracking();
+          }}
+          className="w-full sm:w-auto px-6 py-3 rounded-xl bg-[#111110] text-white hover:bg-black text-xs font-semibold shadow-md transition-colors cursor-pointer"
+        >
+          رهگیری وضعیت بسته در استودیو
+        </button>
+        <button
+          type="button"
+          onClick={handleCloseModal}
+          className="w-full sm:w-auto px-6 py-3 rounded-xl border border-[#BFDDF0] bg-white text-[#111110] hover:bg-gray-50 text-xs font-semibold transition-colors cursor-pointer"
+        >
+          بازگشت به صفحه اصلی
+        </button>
+      </div>
+    </div>
+  );
+
+  const renderCallbackResultView = () => {
+    if (!callbackResult) return null;
+
+    if (callbackResult.loading) {
+      return (
+        <div className="text-center py-12 space-y-4">
+          <Loader2 className="w-12 h-12 animate-spin text-[#111110] mx-auto" />
+          <h3 className="text-lg font-bold text-[#111110]">در حال استعلام نتیجه تراکنش از سرور...</h3>
+          <p className="text-xs text-[#4A5560] max-w-sm mx-auto">
+            لطفاً چند لحظه صبر کنید تا تاییدیه نهایی زرین‌پال و وضعیت سفارش بررسی شود.
+          </p>
+        </div>
+      );
+    }
+
+    if (callbackResult.type === 'success' && callbackResult.order) {
+      return renderPaidOrCardReceipt(callbackResult.order, true);
+    }
+
+    if (callbackResult.type === 'pending_verify') {
+      return (
+        <div className="text-center py-6 space-y-5">
+          <div className="w-16 h-16 bg-amber-100 text-amber-700 rounded-2xl flex items-center justify-center mx-auto shadow-sm">
+            <Clock className="w-9 h-9" />
+          </div>
+          <div className="space-y-2">
+            <h3 className="text-xl font-bold text-[#111110]">تراکنش در انتظار تایید نهایی زرین‌پال است</h3>
+            <p className="text-xs text-[#4A5560] max-w-md mx-auto leading-relaxed">
+              {callbackResult.message ||
+                'پاسخ تایید نهایی از درگاه زرین‌پال به دلیل اختلال موقت شبکه دریافت نشد. برای اطمینان، روی دکمه بررسی مجدد زیر کلیک کنید.'}
+            </p>
+            {callbackResult.orderNumber && (
+              <div className="text-xs font-mono font-bold text-[#111110]">
+                شماره سفارش: {callbackResult.orderNumber}
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+            {callbackResult.order && onReverifyCallbackOrder && (
+              <button
+                type="button"
+                disabled={isCallbackActionBusy}
+                onClick={async () => {
+                  setIsCallbackActionBusy(true);
+                  try {
+                    await onReverifyCallbackOrder(callbackResult.order!);
+                  } finally {
+                    setIsCallbackActionBusy(false);
+                  }
+                }}
+                className="w-full sm:w-auto px-6 py-3 rounded-xl bg-[#111110] text-white hover:bg-black text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+              >
+                {isCallbackActionBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+                <span>بررسی و تایید مجدد پرداخت</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleCloseModal}
+              className="w-full sm:w-auto px-6 py-3 rounded-xl border border-[#BFDDF0] bg-white text-[#111110] hover:bg-gray-50 text-xs font-semibold cursor-pointer"
+            >
+              بستن پنجره
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    // Failed or Cancelled callback
+    const isCancelled = callbackResult.type === 'cancelled';
+    return (
+      <div className="text-center py-6 space-y-5">
+        <div className="w-16 h-16 bg-rose-100 text-rose-700 rounded-2xl flex items-center justify-center mx-auto shadow-sm">
+          <XCircle className="w-10 h-10" />
+        </div>
+
+        <div className="space-y-2">
+          <h3 className="text-xl font-bold text-[#111110]">
+            {isCancelled ? 'پرداخت توسط شما لغو گردید' : 'پرداخت بانکی تایید نشد'}
+          </h3>
+          <p className="text-xs text-[#4A5560] max-w-md mx-auto leading-relaxed">
+            {callbackResult.message ||
+              (isCancelled
+                ? 'شما عملیات پرداخت در درگاه زرین‌پال را لغو کردید. سبد خرید شما دست‌نخورده باقی مانده است و می‌توانید مجدداً پرداخت را انجام دهید.'
+                : 'تراکنش در درگاه بانکی با خطا مواجه شد یا تایید نگردید. در صورت کسر وجه از حساب بانکی، مبلغ ظرف ۷۲ ساعت به‌صورت خودکار به حساب شما بازمی‌گردد.')}
+          </p>
+          {callbackResult.orderNumber && (
+            <div className="text-xs font-mono font-semibold text-[#4A5560]">
+              شماره سفارش: {callbackResult.orderNumber}
+            </div>
+          )}
+        </div>
+
+        <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
+          {callbackResult.order && onRetryCallbackOrder ? (
+            <button
+              type="button"
+              disabled={isCallbackActionBusy}
+              onClick={async () => {
+                setIsCallbackActionBusy(true);
+                try {
+                  await onRetryCallbackOrder(callbackResult.order!);
+                } finally {
+                  setIsCallbackActionBusy(false);
+                }
+              }}
+              className="w-full sm:w-auto px-6 py-3 rounded-xl bg-[#111110] text-white hover:bg-black text-xs font-semibold flex items-center justify-center gap-2 cursor-pointer disabled:opacity-50"
+            >
+              {isCallbackActionBusy ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
+              <span>تلاش مجدد برای پرداخت آنلاین</span>
+            </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                if (onClearCallbackResult) onClearCallbackResult();
+                setStep(3);
+              }}
+              className="w-full sm:w-auto px-6 py-3 rounded-xl bg-[#111110] text-white hover:bg-black text-xs font-semibold cursor-pointer"
+            >
+              بازگشت به مرحله پرداخت
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={handleCloseModal}
+            className="w-full sm:w-auto px-6 py-3 rounded-xl border border-[#BFDDF0] bg-white text-[#111110] hover:bg-gray-50 text-xs font-semibold cursor-pointer"
+          >
+            ادامه خرید / بررسی سبد
+          </button>
+        </div>
+      </div>
+    );
+  };
+
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-6 bg-black/60 backdrop-blur-sm animate-in fade-in duration-200" dir="rtl">
       <div className="bg-white border border-[#BFDDF0] rounded-[24px] w-full max-w-2xl max-h-[92vh] flex flex-col overflow-hidden text-right shadow-2xl relative">
-        
         {/* Top Header */}
         <div className="p-4 sm:p-6 border-b border-[#BFDDF0] bg-white flex items-center justify-between">
           <div>
@@ -258,8 +628,12 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               MORICO STYLE · CHECKOUT
             </span>
             <h2 className="text-base sm:text-xl font-bold text-[#111110] mt-0.5">
-              {completedOrder
-                ? 'رسید نهایی و تایید سفارش'
+              {callbackResult
+                ? callbackResult.type === 'success'
+                  ? 'رسید پرداخت تاییدشده'
+                  : 'وضعیت بازگشت از درگاه پرداخت'
+                : completedOrder
+                ? 'رسید ثبت سفارش (کارت به کارت)'
                 : step === 1
                 ? 'مرور سبد و بررسی اقلام'
                 : step === 2
@@ -270,7 +644,8 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
           {!completedOrder && (
             <button
-              onClick={onClose}
+              type="button"
+              onClick={handleCloseModal}
               className="p-2 rounded-xl border border-[#BFDDF0] hover:bg-gray-100 text-[#111110] transition-colors cursor-pointer"
               aria-label="بستن"
             >
@@ -280,7 +655,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         </div>
 
         {/* Stepper Progress Bar */}
-        {!completedOrder && (
+        {!completedOrder && !callbackResult && (
           <div className="px-6 py-2.5 bg-[#E4F5FF]/40 border-b border-[#BFDDF0] flex items-center justify-between text-xs font-semibold text-[#4A5560]">
             <div
               className={`flex items-center gap-1.5 cursor-pointer ${
@@ -288,9 +663,11 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               }`}
               onClick={() => setStep(1)}
             >
-              <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
-                step >= 1 ? 'bg-[#111110] text-white' : 'bg-gray-200 text-gray-600'
-              }`}>
+              <span
+                className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                  step >= 1 ? 'bg-[#111110] text-white' : 'bg-gray-200 text-gray-600'
+                }`}
+              >
                 ۱
               </span>
               <span>مرور اقلام</span>
@@ -304,20 +681,22 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 if (step > 2) setStep(2);
               }}
             >
-              <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
-                step >= 2 ? 'bg-[#111110] text-white' : 'bg-gray-200 text-gray-600'
-              }`}>
+              <span
+                className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                  step >= 2 ? 'bg-[#111110] text-white' : 'bg-gray-200 text-gray-600'
+                }`}
+              >
                 ۲
               </span>
               <span>اطلاعات پستی</span>
             </div>
             <div className="flex-1 h-[1px] bg-[#BFDDF0] mx-3" />
-            <div className={`flex items-center gap-1.5 ${
-              step >= 3 ? 'text-[#111110]' : 'text-gray-400'
-            }`}>
-              <span className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
-                step >= 3 ? 'bg-[#111110] text-white' : 'bg-gray-200 text-gray-600'
-              }`}>
+            <div className={`flex items-center gap-1.5 ${step >= 3 ? 'text-[#111110]' : 'text-gray-400'}`}>
+              <span
+                className={`w-5 h-5 rounded-full flex items-center justify-center text-[10px] font-bold ${
+                  step >= 3 ? 'bg-[#111110] text-white' : 'bg-gray-200 text-gray-600'
+                }`}
+              >
                 ۳
               </span>
               <span>پرداخت و تایید</span>
@@ -327,97 +706,10 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
         {/* Body Content */}
         <div className="flex-1 overflow-y-auto p-4 sm:p-6 space-y-6">
-          
-          {completedOrder ? (
-            /* ========================================================= */
-            /* SUCCESS CONFIRMATION RECEIPT                              */
-            /* ========================================================= */
-            <div className="text-center py-4 space-y-6">
-              <div className="w-16 h-16 bg-green-100 text-[#2F6B4F] rounded-2xl flex items-center justify-center mx-auto shadow-sm">
-                <CheckCircle2 className="w-10 h-10" />
-              </div>
-
-              <div className="space-y-1.5">
-                <h3 className="text-xl sm:text-2xl font-bold text-[#111110]">
-                  سفارش شما با موفقیت ثبت گردید
-                </h3>
-                <p className="text-xs text-[#4A5560] max-w-md mx-auto leading-relaxed">
-                  اطلاعات سفارش در سیستم ثبت شد و در پنل مدیریت استودیو MORICO قابل مشاهده است. همچنین فاکتور آماده چاپ می‌باشد.
-                </p>
-              </div>
-
-              {/* Order Metadata Box */}
-              <div className="p-4 sm:p-5 rounded-2xl bg-[#E4F5FF]/50 border border-[#BFDDF0] max-w-lg mx-auto space-y-3 text-xs text-right">
-                
-                {/* Order Number */}
-                <div className="flex justify-between items-center pb-2.5 border-b border-[#BFDDF0]/60">
-                  <span className="text-[#4A5560]">شماره فاکتور / سفارش:</span>
-                  <div className="flex items-center gap-1.5 font-bold font-mono text-sm text-[#111110]">
-                    <span>{completedOrder.orderNumber}</span>
-                    <button
-                      onClick={() => handleCopy(completedOrder.orderNumber, 'num')}
-                      className="p-1 hover:text-black text-gray-500 cursor-pointer"
-                      title="کپی شماره سفارش"
-                    >
-                      {copiedKey === 'num' ? <Check className="w-3.5 h-3.5 text-[#2F6B4F]" /> : <Copy className="w-3.5 h-3.5" />}
-                    </button>
-                  </div>
-                </div>
-
-                {/* Tracking Code */}
-                <div className="flex justify-between items-center pb-2.5 border-b border-[#BFDDF0]/60">
-                  <span className="text-[#4A5560]">کد رهگیری پست پیشتاز:</span>
-                  <div className="flex items-center gap-1.5 font-bold font-mono text-[#2F6B4F]">
-                    <span>{completedOrder.trackingCode}</span>
-                    <button
-                      onClick={() => handleCopy(completedOrder.trackingCode, 'trk')}
-                      className="p-1 hover:text-black text-gray-500 cursor-pointer"
-                      title="کپی کد رهگیری"
-                    >
-                      {copiedKey === 'trk' ? <Check className="w-3.5 h-3.5 text-[#2F6B4F]" /> : <Copy className="w-3.5 h-3.5" />}
-                    </button>
-                  </div>
-                </div>
-
-                {/* Customer */}
-                <div className="flex justify-between items-center pb-2.5 border-b border-[#BFDDF0]/60">
-                  <span className="text-[#4A5560]">تحویل‌گیرنده:</span>
-                  <span className="font-semibold text-[#111110]">{completedOrder.customerName} ({formatPersianPhone(completedOrder.customerPhone)})</span>
-                </div>
-
-                {/* Address */}
-                <div className="flex justify-between items-start pb-2.5 border-b border-[#BFDDF0]/60">
-                  <span className="text-[#4A5560] shrink-0">نشانی ارسال:</span>
-                  <span className="font-medium text-[#111110] text-left max-w-xs">{completedOrder.customerAddress}</span>
-                </div>
-
-                {/* Amount Paid */}
-                <div className="flex justify-between items-center pt-1">
-                  <span className="text-[#4A5560] font-semibold">مبلغ پرداخت شده:</span>
-                  <span className="font-bold text-base text-[#111110]">{formatPrice(completedOrder.totalAmount)}</span>
-                </div>
-              </div>
-
-              {/* Actions */}
-              <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
-                <button
-                  onClick={() => {
-                    onClose();
-                    if (onNavigateToTracking) onNavigateToTracking();
-                  }}
-                  className="w-full sm:w-auto px-6 py-3 rounded-xl bg-[#111110] text-white hover:bg-black text-xs font-semibold shadow-md transition-colors cursor-pointer"
-                >
-                  رهگیری وضعیت بسته در استودیو
-                </button>
-                <button
-                  onClick={onClose}
-                  className="w-full sm:w-auto px-6 py-3 rounded-xl border border-[#BFDDF0] bg-white text-[#111110] hover:bg-gray-50 text-xs font-semibold transition-colors cursor-pointer"
-                >
-                  بازگشت به صفحه اصلی
-                </button>
-              </div>
-
-            </div>
+          {callbackResult ? (
+            renderCallbackResultView()
+          ) : completedOrder ? (
+            renderPaidOrCardReceipt(completedOrder, completedOrder.status === 'PAID')
           ) : step === 1 ? (
             /* ========================================================= */
             /* STEP 1: CART REVIEW                                       */
@@ -426,7 +718,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               <div className="space-y-3">
                 {cart.map((item) => {
                   const liveProd = products.find((p) => p.id === item.product.id) || item.product;
-                  const price = liveProd.discountPrice || liveProd.price;
+                  const price = item.selectedVariant
+                    ? item.selectedVariant.discountPrice && item.selectedVariant.discountPrice < item.selectedVariant.price
+                      ? item.selectedVariant.discountPrice
+                      : item.selectedVariant.price
+                    : liveProd.discountPrice && liveProd.discountPrice < liveProd.price
+                    ? liveProd.discountPrice
+                    : liveProd.price;
                   const customFee = item.customization?.customFee || 0;
                   const total = (price + customFee) * item.quantity;
 
@@ -436,7 +734,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                       className="p-3 rounded-xl border border-[#BFDDF0] bg-[#E4F5FF]/20 flex items-center justify-between gap-3 text-xs"
                     >
                       <div className="flex items-center gap-3 min-w-0">
-                        <img loading="lazy" decoding="async"
+                        <img
+                          loading="lazy"
+                          decoding="async"
                           src={liveProd.image}
                           alt={liveProd.name}
                           className="w-12 h-14 object-cover rounded-lg border border-[#BFDDF0] shrink-0"
@@ -444,7 +744,9 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                         <div className="min-w-0">
                           <h4 className="font-bold text-[#111110] truncate">{liveProd.name}</h4>
                           <span className="text-[11px] text-[#4A5560] block mt-0.5">
-                            رنگ: {item.selectedColor} | سایز: {item.selectedSize} | تعداد: {formatPersianNumber(item.quantity)}
+                            {item.selectedVariant ? `${item.selectedVariant.title} | ` : ''}
+                            رنگ: {item.selectedColor || '—'} | سایز: {item.selectedSize || '—'} | تعداد:{' '}
+                            {formatPersianNumber(item.quantity)}
                           </span>
                           {item.customization && (
                             <span className="text-[10px] text-blue-700 font-medium">سفارشی‌سازی شده</span>
@@ -452,9 +754,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                         </div>
                       </div>
 
-                      <div className="text-left font-bold text-[#111110] shrink-0">
-                        {formatPrice(total)}
-                      </div>
+                      <div className="text-left font-bold text-[#111110] shrink-0">{formatPrice(total)}</div>
                     </div>
                   );
                 })}
@@ -480,7 +780,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 )}
                 <div className="flex justify-between">
                   <span className="text-[#4A5560]">هزینه ارسال پیشتاز:</span>
-                  <span>{totals.shippingFee === 0 ? <span className="text-[#2F6B4F] font-bold">رایگان</span> : formatPrice(totals.shippingFee)}</span>
+                  <span>
+                    {totals.shippingFee === 0 ? (
+                      <span className="text-[#2F6B4F] font-bold">رایگان</span>
+                    ) : (
+                      formatPrice(totals.shippingFee)
+                    )}
+                  </span>
                 </div>
                 <div className="pt-2 border-t border-[#BFDDF0] flex justify-between font-bold text-sm text-[#111110]">
                   <span>مبلغ کل سفارش:</span>
@@ -489,6 +795,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               </div>
 
               <button
+                type="button"
                 onClick={handleNextStep}
                 className="w-full py-3.5 rounded-xl bg-[#111110] text-white hover:bg-[#2A2A28] text-xs font-semibold flex items-center justify-center gap-2 shadow-md transition-all cursor-pointer"
               >
@@ -501,13 +808,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
             /* STEP 2: CUSTOMER INFO & SHIPPING ADDRESS                  */
             /* ========================================================= */
             <div className="space-y-4 text-xs">
-              
-              {/* Logged in prompt */}
               {currentUser && (
                 <div className="p-3 bg-[#E4F5FF]/60 border border-[#BFDDF0] rounded-xl flex items-center justify-between text-xs">
                   <div className="flex items-center gap-2 text-[#111110]">
                     <UserIcon className="w-4 h-4" />
-                    <span>ورود با حساب: <strong>{currentUser.name}</strong> ({currentUser.phone})</span>
+                    <span>
+                      ورود با حساب: <strong>{currentUser.name}</strong> ({currentUser.phone})
+                    </span>
                   </div>
                   <span className="text-[10px] text-[#2F6B4F] font-bold">اطلاعات تایید شده</span>
                 </div>
@@ -531,9 +838,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               {/* Name & Phone */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div>
-                  <label className="block font-semibold mb-1 text-[#111110]">
-                    نام و نام خانوادگی تحویل‌گیرنده *
-                  </label>
+                  <label className="block font-semibold mb-1 text-[#111110]">نام و نام خانوادگی تحویل‌گیرنده *</label>
                   <input
                     type="text"
                     value={name}
@@ -569,27 +874,25 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 </div>
               </div>
 
-              {/* Email & Province/City */}
+              {/* Province/City & Postal */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div>
-                  <label className="block font-semibold mb-1 text-[#111110]">
-                    استان *
-                  </label>
+                  <label className="block font-semibold mb-1 text-[#111110]">استان *</label>
                   <select
                     value={province}
                     onChange={(e) => setProvince(e.target.value)}
                     className="w-full px-3 py-2.5 border border-[#BFDDF0] rounded-xl focus:outline-none focus:border-[#111110] bg-white cursor-pointer"
                   >
                     {IRAN_PROVINCES.map((prov) => (
-                      <option key={prov} value={prov}>{prov}</option>
+                      <option key={prov} value={prov}>
+                        {prov}
+                      </option>
                     ))}
                   </select>
                 </div>
 
                 <div>
-                  <label className="block font-semibold mb-1 text-[#111110]">
-                    شهرستان / شهر *
-                  </label>
+                  <label className="block font-semibold mb-1 text-[#111110]">شهرستان / شهر *</label>
                   <input
                     type="text"
                     value={city}
@@ -600,9 +903,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 </div>
 
                 <div>
-                  <label className="block font-semibold mb-1 text-[#111110]">
-                    کد پستی ۱۰ رقمی
-                  </label>
+                  <label className="block font-semibold mb-1 text-[#111110]">کد پستی ۱۰ رقمی</label>
                   <input
                     type="text"
                     value={postalCode}
@@ -673,29 +974,48 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   <ArrowLeft className="w-4 h-4" />
                 </button>
               </div>
-
             </div>
           ) : (
             /* ========================================================= */
             /* STEP 3: PAYMENT & CONFIRMATION                            */
             /* ========================================================= */
             <form onSubmit={handleFinalSubmit} className="space-y-5 text-xs">
-              
+              {submitError && (
+                <div className="p-3.5 rounded-xl border border-rose-300 bg-rose-50 text-rose-900 flex items-start justify-between gap-3">
+                  <div className="flex items-start gap-2.5">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    <div className="space-y-1">
+                      <span className="font-bold block text-xs">خطا در فرآیند ثبت یا اتصال پرداخت</span>
+                      <span className="text-[11px] leading-relaxed block">{submitError}</span>
+                    </div>
+                  </div>
+                  {createdPendingOrder && paymentMethod === 'gateway' && (
+                    <button
+                      type="button"
+                      disabled={isSubmitting}
+                      onClick={() => handleFinalSubmit()}
+                      className="px-3 py-1.5 rounded-lg bg-rose-700 hover:bg-rose-800 text-white text-[11px] font-bold shrink-0 cursor-pointer flex items-center gap-1"
+                    >
+                      <RefreshCw className="w-3 h-3" />
+                      <span>تلاش مجدد اتصال</span>
+                    </button>
+                  )}
+                </div>
+              )}
+
               {/* Payment Methods */}
               <div className="space-y-3">
-                <label className="block font-bold text-sm text-[#111110]">
-                  انتخاب شیوه پرداخت:
-                </label>
+                <label className="block font-bold text-sm text-[#111110]">انتخاب شیوه پرداخت:</label>
 
-                {/* Disconnected Gateway Notice */}
-                {!gatewayStatus?.configured && (
+                {!isGatewayLoading && !isGatewayReady && (
                   <div className="p-3.5 rounded-xl border border-rose-200 bg-rose-50/80 text-rose-900 flex items-start gap-2.5">
                     <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
                     <div>
                       <span className="font-bold block text-xs">درگاه پرداخت اینترنتی متصل نیست</span>
                       <span className="text-[11px] text-rose-800 leading-relaxed block mt-0.5">
-                        {gatewayStatus?.disabledReason || 'درگاه پرداخت آنلاین اینترنتی هنوز متصل نشده است. تا زمان اتصال درگاه توسط مدیریت، امکان پرداخت آنلاین وجود ندارد.'}
-                        {' '}جهت ثبت سفارش، می‌توانید گزینه «کارت به کارت» را انتخاب فرمایید.
+                        {gatewayStatus?.disabledReason ||
+                          'درگاه پرداخت آنلاین اینترنتی هنوز متصل نشده است. تا زمان اتصال درگاه توسط مدیریت، امکان پرداخت آنلاین وجود ندارد.'}{' '}
+                        جهت ثبت سفارش، می‌توانید گزینه «کارت به کارت» را انتخاب فرمایید.
                       </span>
                     </div>
                   </div>
@@ -704,12 +1024,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 {/* Gateway option */}
                 <div
                   onClick={() => {
-                    if (gatewayStatus?.configured) {
+                    if (isGatewayReady && !isSubmitting) {
                       setPaymentMethod('gateway');
+                      setSubmitError(null);
                     }
                   }}
                   className={`p-4 rounded-2xl border transition-all flex items-center justify-between gap-3 ${
-                    !gatewayStatus?.configured
+                    !isGatewayReady
                       ? 'border-gray-200 bg-gray-50/60 opacity-75 cursor-not-allowed'
                       : paymentMethod === 'gateway'
                       ? 'border-[#111110] bg-[#E4F5FF]/40 ring-1 ring-[#111110] cursor-pointer'
@@ -721,11 +1042,15 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                       <CreditCard className="w-5 h-5" />
                     </div>
                     <div>
-                      <div className="font-bold text-sm text-[#111110] flex items-center gap-2">
-                        <span>پرداخت آنلاین با کلیه کارتهای بانکی (شتاب)</span>
-                        {gatewayStatus?.configured ? (
+                      <div className="font-bold text-sm text-[#111110] flex items-center gap-2 flex-wrap">
+                        <span>پرداخت آنلاین با کلیه کارتهای بانکی (زرین‌پال)</span>
+                        {isGatewayLoading ? (
+                          <span className="px-2 py-0.5 rounded-full bg-gray-100 text-gray-600 text-[10px] font-bold">
+                            در حال بررسی...
+                          </span>
+                        ) : isGatewayReady ? (
                           <span className="px-2 py-0.5 rounded-full bg-green-100 text-green-800 text-[10px] font-bold">
-                            فعال
+                            {gatewayStatus?.mode === 'sandbox' ? 'فعال (آزمایشی Sandbox)' : 'فعال'}
                           </span>
                         ) : (
                           <span className="px-2 py-0.5 rounded-full bg-rose-100 text-rose-800 text-[10px] font-bold">
@@ -734,26 +1059,33 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                         )}
                       </div>
                       <span className="text-[11px] text-[#4A5560] block mt-0.5">
-                        {gatewayStatus?.configured
-                          ? `متصل به درگاه امن ${gatewayStatus?.gatewayName || 'شاپرک'} با رمز پویا`
+                        {isGatewayReady
+                          ? `انتقال امن به صفحه پرداخت ${gatewayStatus?.gatewayName || 'زرین‌پال'} با تایید سرور`
                           : 'درگاه هنوز متصل نشده است — پرداخت آنلاین تا زمان اتصال توسط مدیریت غیرفعال می‌باشد.'}
                       </span>
                     </div>
                   </div>
-                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${
-                    !gatewayStatus?.configured
-                      ? 'border-gray-200 bg-gray-100'
-                      : paymentMethod === 'gateway'
-                      ? 'border-[#111110] bg-[#111110]'
-                      : 'border-gray-300'
-                  }`}>
-                    {paymentMethod === 'gateway' && gatewayStatus?.configured && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
+                  <div
+                    className={`w-4 h-4 rounded-full border flex items-center justify-center ${
+                      !isGatewayReady
+                        ? 'border-gray-200 bg-gray-100'
+                        : paymentMethod === 'gateway'
+                        ? 'border-[#111110] bg-[#111110]'
+                        : 'border-gray-300'
+                    }`}
+                  >
+                    {paymentMethod === 'gateway' && isGatewayReady && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
                   </div>
                 </div>
 
                 {/* Card to Card option */}
                 <div
-                  onClick={() => setPaymentMethod('card')}
+                  onClick={() => {
+                    if (!isSubmitting) {
+                      setPaymentMethod('card');
+                      setSubmitError(null);
+                    }
+                  }}
                   className={`p-4 rounded-2xl border transition-all cursor-pointer flex items-center justify-between gap-3 ${
                     paymentMethod === 'card'
                       ? 'border-[#111110] bg-[#E4F5FF]/40 ring-1 ring-[#111110]'
@@ -765,17 +1097,17 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                       <Building className="w-5 h-5" />
                     </div>
                     <div>
-                      <div className="font-bold text-sm text-[#111110]">
-                        واریز به حساب رسمی آتلیه (کارت به کارت)
-                      </div>
+                      <div className="font-bold text-sm text-[#111110]">واریز به حساب رسمی آتلیه (کارت به کارت)</div>
                       <span className="text-[11px] text-[#4A5560] block mt-0.5">
-                        شماره حساب و کارت استودیو MORICO پس از ثبت نمایش داده می‌شود
+                        ثبت سفارش در وضعیت «در انتظار پرداخت» و نمایش راهنمای واریز رسمی
                       </span>
                     </div>
                   </div>
-                  <div className={`w-4 h-4 rounded-full border flex items-center justify-center ${
-                    paymentMethod === 'card' ? 'border-[#111110] bg-[#111110]' : 'border-gray-300'
-                  }`}>
+                  <div
+                    className={`w-4 h-4 rounded-full border flex items-center justify-center ${
+                      paymentMethod === 'card' ? 'border-[#111110] bg-[#111110]' : 'border-gray-300'
+                    }`}
+                  >
                     {paymentMethod === 'card' && <div className="w-1.5 h-1.5 rounded-full bg-white" />}
                   </div>
                 </div>
@@ -787,9 +1119,20 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                   خلاصه اطلاعات ارسال:
                 </span>
                 <div className="grid grid-cols-2 gap-2 text-[11px]">
-                  <div><span className="text-[#4A5560]">تحویل‌گیرنده:</span> <strong className="text-[#111110]">{name}</strong></div>
-                  <div><span className="text-[#4A5560]">شماره تماس:</span> <strong className="text-[#111110] font-mono">{formatPersianPhone(phone)}</strong></div>
-                  <div className="col-span-2"><span className="text-[#4A5560]">نشانی:</span> <span className="text-[#111110]">{province}، {city}، {address}</span></div>
+                  <div>
+                    <span className="text-[#4A5560]">تحویل‌گیرنده:</span>{' '}
+                    <strong className="text-[#111110]">{name}</strong>
+                  </div>
+                  <div>
+                    <span className="text-[#4A5560]">شماره تماس:</span>{' '}
+                    <strong className="text-[#111110] font-mono">{formatPersianPhone(phone)}</strong>
+                  </div>
+                  <div className="col-span-2">
+                    <span className="text-[#4A5560]">نشانی:</span>{' '}
+                    <span className="text-[#111110]">
+                      {province}، {city}، {address}
+                    </span>
+                  </div>
                 </div>
               </div>
 
@@ -813,7 +1156,13 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
                 )}
                 <div className="flex justify-between">
                   <span className="text-[#4A5560]">هزینه ارسال پیشتاز:</span>
-                  <span>{totals.shippingFee === 0 ? <span className="text-[#2F6B4F] font-bold">رایگان</span> : formatPrice(totals.shippingFee)}</span>
+                  <span>
+                    {totals.shippingFee === 0 ? (
+                      <span className="text-[#2F6B4F] font-bold">رایگان</span>
+                    ) : (
+                      formatPrice(totals.shippingFee)
+                    )}
+                  </span>
                 </div>
                 <div className="pt-2 border-t border-[#BFDDF0] flex justify-between font-bold text-base text-[#111110]">
                   <span>مبلغ قابل پرداخت نهایی:</span>
@@ -825,38 +1174,49 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
               <div className="flex items-center gap-3 pt-2">
                 <button
                   type="button"
+                  disabled={isSubmitting}
                   onClick={() => setStep(2)}
-                  className="px-4 py-3 rounded-xl border border-[#BFDDF0] hover:bg-gray-100 text-[#111110] font-semibold transition-colors flex items-center gap-1.5 cursor-pointer"
+                  className="px-4 py-3 rounded-xl border border-[#BFDDF0] hover:bg-gray-100 text-[#111110] font-semibold transition-colors flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
                 >
                   <ArrowRight className="w-4 h-4" />
                   <span>ویرایش آدرس</span>
                 </button>
                 <button
                   type="submit"
-                  disabled={isSubmitting || totals.hasOutOfStock || (paymentMethod === 'gateway' && !gatewayStatus?.configured)}
+                  disabled={
+                    isSubmitting ||
+                    isGatewayLoading ||
+                    totals.hasOutOfStock ||
+                    (paymentMethod === 'gateway' && !isGatewayReady)
+                  }
                   className="flex-1 py-3.5 sm:py-4 rounded-xl bg-[#111110] text-white hover:bg-[#2A2A28] disabled:opacity-50 text-xs sm:text-sm font-semibold flex items-center justify-center gap-2 shadow-md transition-all active:scale-[0.99] cursor-pointer"
                 >
-                  <ShieldCheck className="w-4 h-4 text-green-400" />
+                  {isSubmitting ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-green-400" />
+                  ) : (
+                    <ShieldCheck className="w-4 h-4 text-green-400" />
+                  )}
                   <span>
-                    {isSubmitting
-                      ? 'در حال پردازش سفارش...'
-                      : paymentMethod === 'gateway' && !gatewayStatus?.configured
+                    {paymentPhase === 'creating_order'
+                      ? 'در حال ثبت سفارش در سرور...'
+                      : paymentPhase === 'connecting_gateway'
+                      ? 'در حال دریافت مجوز از زرین‌پال...'
+                      : paymentPhase === 'redirecting'
+                      ? 'در حال انتقال به درگاه بانکی...'
+                      : paymentMethod === 'gateway' && !isGatewayReady
                       ? 'درگاه پرداخت متصل نیست — امکان پرداخت وجود ندارد'
                       : paymentMethod === 'gateway'
-                      ? `پرداخت آنلاین و ثبت سفارش (${formatPrice(totals.finalTotal)})`
+                      ? `پرداخت آنلاین از طریق زرین‌پال (${formatPrice(totals.finalTotal)})`
                       : `ثبت سفارش با پرداخت کارت به کارت (${formatPrice(totals.finalTotal)})`}
                   </span>
                 </button>
               </div>
-
             </form>
           )}
-
         </div>
-
       </div>
 
-      {/* Interactive Location Picker Modal (Parsimap) */}
+      {/* Interactive Location Picker Modal */}
       <LocationPickerModal
         isOpen={isLocationModalOpen}
         onClose={() => setIsLocationModalOpen(false)}

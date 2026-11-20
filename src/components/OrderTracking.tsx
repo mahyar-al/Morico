@@ -21,8 +21,8 @@ export const OrderTracking: React.FC<OrderTrackingProps> = ({ orders = [] }) => 
     const cleanNum = orderNumber.trim();
     const cleanPhone = customerPhone.trim();
 
-    if (!cleanNum) {
-      setErrorMessage('لطفاً شماره سفارش را وارد فرمایید.');
+    if (!cleanNum || !cleanPhone) {
+      setErrorMessage('لطفاً شماره سفارش و شماره تماس ثبت‌شده را به‌صورت کامل وارد فرمایید.');
       return;
     }
 
@@ -43,28 +43,11 @@ export const OrderTracking: React.FC<OrderTrackingProps> = ({ orders = [] }) => 
 
       const data = await response.json().catch(() => ({}));
 
-      if (response.ok && data.id) {
+      if (response.ok && data.orderNumber) {
         setSearchedOrder(data);
       } else {
-        // Fallback check against in-memory orders passed as prop (strictly checking phone if provided)
-        const foundLocal = orders.find((o) => {
-          const matchNum =
-            o.orderNumber?.toLowerCase() === cleanNum.toLowerCase() ||
-            o.trackingCode?.toLowerCase() === cleanNum.toLowerCase() ||
-            o.id?.toLowerCase() === cleanNum.toLowerCase();
-          if (!matchNum) return false;
-          if (cleanPhone) {
-            return o.customerPhone?.replace(/\D/g, '').includes(cleanPhone.replace(/\D/g, ''));
-          }
-          return true;
-        });
-
-        if (foundLocal) {
-          setSearchedOrder(foundLocal);
-        } else {
-          setSearchedOrder(null);
-          setErrorMessage(data.error || 'سفارشی با این مشخصات یافت نشد. لطفاً شماره سفارش و شماره تماس را بررسی نمایید.');
-        }
+        setSearchedOrder(null);
+        setErrorMessage(data.error || 'سفارشی با این شماره سفارش و شماره تماس یافت نشد.');
       }
     } catch {
       setSearchedOrder(null);
@@ -85,7 +68,28 @@ export const OrderTracking: React.FC<OrderTrackingProps> = ({ orders = [] }) => 
       case 'DELIVERED':
         return 4;
       default:
-        return 1;
+        return 0;
+    }
+  };
+
+  const isSpecialUnpaidStatus = (status: string) =>
+    ['PENDING_PAYMENT', 'PAYMENT_FAILED', 'CANCELLED', 'CANCELED', 'REFUNDED', 'RETURNED'].includes(status);
+
+  const getSpecialStatusLabel = (status: string) => {
+    switch (status) {
+      case 'PENDING_PAYMENT':
+        return { text: 'در انتظار پرداخت / تایید واریز', color: 'bg-amber-50 border-amber-200 text-amber-800' };
+      case 'PAYMENT_FAILED':
+        return { text: 'پرداخت بانکی ناموفق یا لغو شده', color: 'bg-rose-50 border-rose-200 text-rose-800' };
+      case 'CANCELLED':
+      case 'CANCELED':
+        return { text: 'سفارش لغو شده', color: 'bg-rose-50 border-rose-200 text-rose-800' };
+      case 'REFUNDED':
+        return { text: 'مبلغ مسترد شده', color: 'bg-gray-100 border-gray-300 text-gray-800' };
+      case 'RETURNED':
+        return { text: 'مرجوع شده', color: 'bg-gray-100 border-gray-300 text-gray-800' };
+      default:
+        return { text: status, color: 'bg-gray-50 border-gray-200 text-gray-800' };
     }
   };
 
@@ -123,6 +127,7 @@ export const OrderTracking: React.FC<OrderTrackingProps> = ({ orders = [] }) => 
           <div className="relative sm:w-48">
             <input
               type="tel"
+              required
               value={customerPhone}
               onChange={(e) => setCustomerPhone(e.target.value)}
               placeholder="شماره تماس ثبت‌شده..."
@@ -172,50 +177,59 @@ export const OrderTracking: React.FC<OrderTrackingProps> = ({ orders = [] }) => 
               <div className="text-left sm:text-left">
                 <span className="text-[11px] text-[#4A5560] block">تاریخ ثبت:</span>
                 <span className="text-xs font-medium text-[#111110]">
-                  {formatJalaliDateTime(searchedOrder.createdAt)}
+                  {formatJalaliDateTime(searchedOrder.date || searchedOrder.createdAt)}
                 </span>
               </div>
             </div>
 
-            {/* Stepper */}
-            <div className="py-4">
-              <div className="flex items-center justify-between relative">
-                <div className="absolute top-1/2 left-0 right-0 h-1 bg-[#E4F5FF] -translate-y-1/2 z-0" />
-                <div
-                  className="absolute top-1/2 right-0 h-1 bg-[#111110] -translate-y-1/2 z-0 transition-all duration-500"
-                  style={{
-                    width: `${((getStatusStep(searchedOrder.status) - 1) / 3) * 100}%`
-                  }}
-                />
-
-                {[
-                  { step: 1, label: 'تایید پرداخت', icon: CheckCircle2 },
-                  { step: 2, label: 'در حال دوخت و چاپ', icon: Clock },
-                  { step: 3, label: 'تحویل به پست', icon: Truck },
-                  { step: 4, label: 'تحویل نهایی', icon: Package }
-                ].map((s) => {
-                  const currentStep = getStatusStep(searchedOrder.status);
-                  const isDone = currentStep >= s.step;
-                  const Icon = s.icon;
-                  return (
-                    <div key={s.step} className="relative z-10 flex flex-col items-center gap-2">
-                      <div
-                        className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${
-                          isDone
-                            ? 'bg-[#111110] text-white'
-                            : 'bg-white border-2 border-[#BFDDF0] text-gray-400'
-                        }`}
-                      >
-                        <Icon className="w-5 h-5" />
-                      </div>
-                      <span className="text-[11px] font-medium text-[#111110] text-center">
-                        {s.label}
-                      </span>
-                    </div>
-                  );
-                })}
+            {isSpecialUnpaidStatus(searchedOrder.status) ? (
+              <div className={`p-4 rounded-xl border text-xs font-semibold flex items-center justify-between ${getSpecialStatusLabel(searchedOrder.status).color}`}>
+                <span>وضعیت فعلی سفارش: {getSpecialStatusLabel(searchedOrder.status).text}</span>
+                {searchedOrder.paymentStatus && (
+                  <span className="font-mono text-[11px]">({searchedOrder.paymentStatus})</span>
+                )}
               </div>
-            </div>
+            ) : (
+              /* Stepper */
+              <div className="py-4">
+                <div className="flex items-center justify-between relative">
+                  <div className="absolute top-1/2 left-0 right-0 h-1 bg-[#E4F5FF] -translate-y-1/2 z-0" />
+                  <div
+                    className="absolute top-1/2 right-0 h-1 bg-[#111110] -translate-y-1/2 z-0 transition-all duration-500"
+                    style={{
+                      width: `${(Math.max(0, getStatusStep(searchedOrder.status) - 1) / 3) * 100}%`
+                    }}
+                  />
+
+                  {[
+                    { step: 1, label: 'تایید پرداخت', icon: CheckCircle2 },
+                    { step: 2, label: 'در حال دوخت و چاپ', icon: Clock },
+                    { step: 3, label: 'تحویل به پست', icon: Truck },
+                    { step: 4, label: 'تحویل نهایی', icon: Package }
+                  ].map((s) => {
+                    const currentStep = getStatusStep(searchedOrder.status);
+                    const isDone = currentStep >= s.step;
+                    const Icon = s.icon;
+                    return (
+                      <div key={s.step} className="relative z-10 flex flex-col items-center gap-2">
+                        <div
+                          className={`w-10 h-10 rounded-full flex items-center justify-center transition-colors ${
+                            isDone
+                              ? 'bg-[#111110] text-white'
+                              : 'bg-white border-2 border-[#BFDDF0] text-gray-400'
+                          }`}
+                        >
+                          <Icon className="w-5 h-5" />
+                        </div>
+                        <span className="text-[11px] font-medium text-[#111110] text-center">
+                          {s.label}
+                        </span>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
 
             {/* Tracking Code if Shipped */}
             {searchedOrder.trackingCode && (
@@ -241,28 +255,38 @@ export const OrderTracking: React.FC<OrderTrackingProps> = ({ orders = [] }) => 
             <div className="space-y-3 pt-2">
               <h4 className="text-xs font-bold text-[#111110]">اقلام سفارش:</h4>
               <div className="divide-y divide-[#BFDDF0]/60 border border-[#BFDDF0] rounded-xl overflow-hidden">
-                {searchedOrder.items?.map((item: any, idx: number) => (
-                  <div key={idx} className="p-3.5 flex items-center justify-between gap-3 text-xs bg-white">
-                    <div className="flex items-center gap-3">
-                      <div className="w-12 h-12 rounded-lg bg-[#E4F5FF] border border-[#BFDDF0] overflow-hidden shrink-0 flex items-center justify-center p-1">
-                        <img loading="lazy" decoding="async"
-                          src={item.product?.image || '/mockups/tee-front.svg'}
-                          alt={item.product?.name || 'محصول'}
-                          className="w-full h-full object-contain"
-                        />
+                {searchedOrder.items?.map((item: any, idx: number) => {
+                  const pName = item.product?.name || item.productName || 'محصول آتلیه MORICO';
+                  const pImage = item.product?.image || item.image || '/mockups/tee-front.svg';
+                  const pColor = item.selectedColor || item.color || '—';
+                  const pSize = item.selectedSize || item.size || '—';
+                  const pUnitPrice = item.unitPrice ?? item.product?.price ?? 0;
+
+                  return (
+                    <div key={idx} className="p-3.5 flex items-center justify-between gap-3 text-xs bg-white">
+                      <div className="flex items-center gap-3">
+                        <div className="w-12 h-12 rounded-lg bg-[#E4F5FF] border border-[#BFDDF0] overflow-hidden shrink-0 flex items-center justify-center p-1">
+                          <img
+                            loading="lazy"
+                            decoding="async"
+                            src={pImage}
+                            alt={pName}
+                            className="w-full h-full object-contain"
+                          />
+                        </div>
+                        <div>
+                          <h5 className="font-bold text-[#111110]">{pName}</h5>
+                          <span className="text-[11px] text-[#4A5560]">
+                            رنگ: {pColor} · سایز: {pSize} · تعداد: {formatPersianNumber(item.quantity)}
+                          </span>
+                        </div>
                       </div>
-                      <div>
-                        <h5 className="font-bold text-[#111110]">{item.product?.name}</h5>
-                        <span className="text-[11px] text-[#4A5560]">
-                          رنگ: {item.selectedColor} · سایز: {item.selectedSize} · تعداد: {formatPersianNumber(item.quantity)}
-                        </span>
-                      </div>
+                      <span className="font-semibold text-[#111110]">
+                        {formatPrice(pUnitPrice * item.quantity)}
+                      </span>
                     </div>
-                    <span className="font-semibold text-[#111110]">
-                      {formatPrice((item.product?.price || 0) * item.quantity)}
-                    </span>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
 
@@ -272,9 +296,9 @@ export const OrderTracking: React.FC<OrderTrackingProps> = ({ orders = [] }) => 
                 مقصد ارسال: {searchedOrder.customerProvince || 'تهران'} - {searchedOrder.customerCity || 'تهران'}
               </span>
               <div className="text-left">
-                <span className="text-[11px] text-[#4A5560] block">مبلغ کل پرداخت‌شده:</span>
+                <span className="text-[11px] text-[#4A5560] block">مبلغ کل سفارش:</span>
                 <span className="text-sm font-bold text-[#111110]">
-                  {formatPrice(searchedOrder.total || 0)}
+                  {formatPrice(searchedOrder.totalAmount ?? searchedOrder.total ?? 0)}
                 </span>
               </div>
             </div>

@@ -441,47 +441,32 @@ export function useAppStore() {
     } catch {}
   };
 
-  const addOrder = async (order: Order) => {
-    // 1. Locally decrement stock immediately
-    const updatedProducts = products.map((p) => {
-      const orderedItem = order.items.find((item) => item.product.id === p.id);
-      if (orderedItem) {
-        return {
-          ...p,
-          stock: Math.max(0, (p.stock || 0) - orderedItem.quantity)
-        };
-      }
-      return p;
+  const addOrder = useCallback((order: Order) => {
+    const isPaidOrder = ['PAID', 'PROCESSING', 'SHIPPED', 'DELIVERED'].includes(order.status);
+    const isCardOrder = Boolean(order.paymentMethod && order.paymentMethod.includes('کارت به کارت'));
+
+    // 1. Save order locally without duplicating server POST /api/orders
+    setOrders((prev) => {
+      const filtered = prev.filter((o) => o.id !== order.id && o.orderNumber !== order.orderNumber);
+      const updatedOrders = [order, ...filtered];
+      try {
+        localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(updatedOrders));
+      } catch {}
+      return updatedOrders;
     });
-    setProducts(updatedProducts);
-    try {
-      localStorage.setItem(STORAGE_KEYS.PRODUCTS, JSON.stringify(updatedProducts));
-    } catch {}
 
-    // 2. Save order locally
-    const updatedOrders = [order, ...orders];
-    setOrders(updatedOrders);
-    try {
-      localStorage.setItem(STORAGE_KEYS.ORDERS, JSON.stringify(updatedOrders));
-    } catch {}
-
-    // 3. Clear cart
-    clearCart();
-
-    // 4. Send real API request to server for persistent storage
-    try {
-      await fetch('/api/orders', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(order)
-      });
-    } catch (err) {
-      console.warn('Order sync to server failed, stored in client fallback:', err);
+    // 2. Clear cart and sync server inventory only for confirmed/paid or submitted card orders
+    if (isPaidOrder || isCardOrder) {
+      clearCart();
     }
 
-    // 5. Broadcast live sync to all browser windows & admin panel
+    if (isPaidOrder) {
+      refreshAll();
+    }
+
+    // 3. Broadcast live sync to other storefront/admin tabs
     broadcastStoreUpdate();
-  };
+  }, [refreshAll]);
 
   const updateOrderStatus = (orderId: string, status: Order['status']) => {
     const updated = orders.map((o) => (o.id === orderId || o.orderNumber === orderId ? { ...o, status } : o));
