@@ -50,11 +50,13 @@ npm ci --legacy-peer-deps
 | `ADMIN_USERNAME` | نام کاربری پنل ادمین | `morico_admin` |
 | `ADMIN_PASSWORD` | رمز عبور قوی ادمین | *(رشته قوی تصادفی)* |
 | `SESSION_SECRET` | کلید امضای توکن‌های JOSE (حداقل ۳۲ کاراکتر) | *(خروجی `openssl rand -hex 32`)* |
-| `REQUIRE_ADMIN_MFA` | اجباری بودن MFA ادمین در production | `true` |
+| `REQUIRE_ADMIN_MFA` | الزام MFA ادمین (تا زمان وجود UI باید `false` باشد) | `false` |
 | `ZARINPAL_MODE` | حالت درگاه (`sandbox` یا `production`) | `production` |
 | `ZARINPAL_MERCHANT_ID` | مرچنت آیدی UUID ۳۶ کاراکتری زرین‌پال | *(UUID واقعی پذیرنده)* |
 | `ZARINPAL_CALLBACK_URL` | آدرس ثابت HTTPS بازگشت بانکی | `https://moricoland.ir/api/payments/zarinpal/callback` |
 | `REDIS_URL` | اختیاری — برای Redis در Rate Limit / Revocation | *(اختیاری)* |
+
+> **هشدار مهم درباره‌ی `REQUIRE_ADMIN_MFA`**: در حال حاضر در فرانت‌اند (`src/`) صفحه یا رابط کاربری برای ورود یا راه‌اندازی MFA وجود ندارد. بنابراین تا زمان پیاده‌سازی UI مربوطه، این متغیر **نباید** روی `true` تنظیم شود (در غیر این صورت میان‌افزار سرور همه‌ی مسیرهای ادمین را با کد `403` و پیام `mustSetupMfa` مسدود کرده و ادمین قفل می‌شود).
 
 > **قواعد ایمنی Fail-Fast در زمان راه‌اندازی (`production`)**:
 > - اگر `NODE_ENV !== 'production'` باشد و `ZARINPAL_MODE=production` تنظیم شود، سرور بالا نمی‌آید.
@@ -71,17 +73,26 @@ npm ci --legacy-peer-deps
 2. **مسیر پایدار داده خارج از پوشه‌ی برنامه (`DATA_DIR` / `UPLOADS_DIR`)**:
    پوشه‌های `/home/USER/morico_data` و `/home/USER/morico_uploads` را خارج از ریشه‌ی کد اپ ایجاد کنید تا با استقرار یا آپلود نسخه‌های جدید کد، فایل‌های `store.json` و تصاویر طراحی سفارشی مشتریان بازنویسی نشوند.
 
-3. **بیلد و راه‌اندازی**:
-   - در cPanel Node.js App:
+3. **بیلد محلی و استقرار روی سرور cPanel**:
+   - **مرحله اول (روی کامپیوتر محلی)**: بیلد را روی سیستم خودتان اجرا کنید:
+     ```bash
+     npm ci --legacy-peer-deps && npm run build
+     ```
+     *(دستور `npm run build` باندل کلاینت را در `dist/` و باندل سرور ESM را در `dist/server.js` می‌سازد و فایل‌های نمونه/تست `uploads` و `assets/aistudio` را از خروجی `dist/` حذف می‌کند.)*
+   - **مرحله دوم (آپلود به هاست cPanel)**: فقط پوشه و فایل‌های زیر را به پوشه‌ی اپ روی سرور منتقل کنید:
+     - `dist/`
+     - `package.json`
+     - `package-lock.json`
+     - `app.cjs`
+     *(در صورت اجرای بکاپ روزانه روی همین هاست، فایل `scripts/backup-data.sh` را نیز همراه ببرید.)*
+   - **مرحله سوم (تنظیم در cPanel Node.js App)**:
      - **Node.js Version**: `22.x`
      - **Application Mode**: `Production`
      - **Application Startup File**: `app.cjs` (متغیر `NODE_ENV=production` را تنظیم کرده و `./dist/server.js` را اجرا می‌کند)
-   - اجرای نصب و بیلد:
+   - **مرحله چهارم (نصب روی سرور)**: روی سرور هاست فقط وابستگی‌های production را نصب کنید (روی سرور `npm run build` اجرا نشود):
      ```bash
      npm ci --omit=dev --legacy-peer-deps
-     npm run build
      ```
-     *(دستور `npm run build` باندل کلاینت را در `dist/` و باندل سرور ESM را در `dist/server.js` می‌سازد و فایل‌های نمونه/تست `uploads` و `assets/aistudio` را از خروجی `dist/` حذف می‌کند.)*
    - در نهایت در پنل Node.js App روی **Restart** کلیک کنید.
 
 4. **پایش سلامت سرویس (`Health Check`)**:
