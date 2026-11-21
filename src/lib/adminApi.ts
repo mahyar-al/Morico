@@ -551,10 +551,14 @@ export const adminApi = {
     });
   },
 
-  async updateOrderStatus(id: string, status: OrderStatus): Promise<Order> {
+  async updateOrderStatus(
+    id: string,
+    status: OrderStatus,
+    extra?: { confirmManualPaid?: boolean; reason?: string }
+  ): Promise<Order> {
     return await adminFetch(
       `/api/orders/${id}/status`,
-      { method: 'PUT', body: JSON.stringify({ status }) },
+      { method: 'PUT', body: JSON.stringify({ status, ...(extra || {}) }) },
       () => {
         const list = getStored(STORAGE_KEYS.ORDERS, INITIAL_ORDERS);
         const updated = list.map((o) =>
@@ -791,7 +795,6 @@ export const adminApi = {
     orderId?: string;
     idempotencyKey?: string;
     paymentToken?: string;
-    phone?: string;
   }): Promise<PaymentRequestResponse> {
     const headers: Record<string, string> = {};
     if (payload.paymentToken) {
@@ -809,7 +812,6 @@ export const adminApi = {
     orderNumber: string;
     orderId?: string;
     paymentToken?: string;
-    phone?: string;
   }): Promise<PaymentVerifyResponse> {
     const headers: Record<string, string> = {};
     if (payload.paymentToken) {
@@ -824,16 +826,14 @@ export const adminApi = {
 
   async getPaymentResult(
     orderNumber: string,
-    paymentToken?: string,
-    phone?: string
+    paymentToken?: string
   ): Promise<{ success: boolean; order: Order }> {
     const headers: Record<string, string> = {};
     if (paymentToken) {
       headers['X-Payment-Token'] = paymentToken;
     }
-    const qs = phone ? `?phone=${encodeURIComponent(phone)}` : '';
     return await paymentFetch<{ success: boolean; order: Order }>(
-      `/api/payments/orders/${encodeURIComponent(orderNumber)}/result${qs}`,
+      `/api/payments/orders/${encodeURIComponent(orderNumber)}/result`,
       {
         method: 'GET',
         headers

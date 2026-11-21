@@ -26,7 +26,11 @@ import {
 interface OrderDetailModalProps {
   order: Order | null;
   onClose: () => void;
-  onUpdateStatus: (orderId: string, status: OrderStatus) => Promise<void>;
+  onUpdateStatus: (
+    orderId: string,
+    status: OrderStatus,
+    extra?: { confirmManualPaid?: boolean; reason?: string }
+  ) => Promise<void>;
   onDeleteOrder: (orderId: string) => Promise<void>;
   onPrintA4Sheet: (order: Order) => void;
   onPrintShippingLabel: (order: Order) => void;
@@ -45,6 +49,8 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
 }) => {
   const [copiedKey, setCopiedKey] = useState<string | null>(null);
   const [isConfirmingCancel, setIsConfirmingCancel] = useState(false);
+  const [isConfirmingManualPaid, setIsConfirmingManualPaid] = useState(false);
+  const [manualPaidReasonInput, setManualPaidReasonInput] = useState('');
   const [selectedStatus, setSelectedStatus] = useState<OrderStatus>(order?.status || 'PENDING_PAYMENT');
   const [isDeleting, setIsDeleting] = useState(false);
   const [deleteConfirmationInput, setDeleteConfirmationInput] = useState('');
@@ -54,9 +60,17 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
     if (order?.status) {
       setSelectedStatus(order.status);
     }
-  }, [order?.status]);
+    setIsConfirmingCancel(false);
+    setIsConfirmingManualPaid(false);
+    setManualPaidReasonInput('');
+  }, [order?.id, order?.status]);
 
   if (!order) return null;
+
+  const isGatewayWithoutRefId =
+    (String(order.paymentMethod || '').includes('درگاه') ||
+      String(order.paymentMethod || '').toLowerCase().includes('zarinpal')) &&
+    !order.paymentInfo?.refId;
 
   const copyToClipboard = (text: string, key: string) => {
     navigator.clipboard.writeText(text);
@@ -66,11 +80,29 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
 
   const handleStatusChange = async (newStatus: OrderStatus) => {
     if (newStatus === 'CANCELED' || newStatus === 'CANCELLED') {
+      setIsConfirmingManualPaid(false);
       setIsConfirmingCancel(true);
+      return;
+    }
+    if (newStatus === 'PAID' && isGatewayWithoutRefId) {
+      setIsConfirmingCancel(false);
+      setIsConfirmingManualPaid(true);
       return;
     }
     setSelectedStatus(newStatus);
     await onUpdateStatus(order.id, newStatus);
+  };
+
+  const handleConfirmManualPaid = async () => {
+    const cleanReason = manualPaidReasonInput.trim();
+    if (cleanReason.length < 3) return;
+    setIsConfirmingManualPaid(false);
+    setSelectedStatus('PAID');
+    await onUpdateStatus(order.id, 'PAID', {
+      confirmManualPaid: true,
+      reason: cleanReason
+    });
+    setManualPaidReasonInput('');
   };
 
   const handleConfirmCancel = async () => {
@@ -184,6 +216,25 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
           </div>
         </div>
 
+        {/* Needs Review Critical Banner (A5 / B4) */}
+        {order.needsReview && (
+          <div className="p-4 rounded-2xl border border-red-300 bg-red-50 text-red-800 text-xs flex items-start gap-3">
+            <AlertTriangle className="w-5 h-5 shrink-0 text-red-600 mt-0.5" />
+            <div className="space-y-1">
+              <div className="font-bold text-red-900">
+                هشدار نیازمند بررسی فوری مدیریت ({order.reviewReason || 'REVIEW_REQUIRED'})
+              </div>
+              <p className="leading-relaxed">
+                {order.reviewReason === 'INSUFFICIENT_STOCK'
+                  ? 'پرداخت این سفارش در درگاه بانکی تایید شده اما هنگام کسر موجودی انبار، کالا با کسری موجودی مواجه شده است. لطفاً برای تأمین کالا یا استرداد وجه اقدام فرمایید.'
+                  : order.reviewReason === 'PAID_AFTER_CANCEL'
+                  ? 'این سفارش پیش از تکمیل بررسی در وضعیت لغوشده قرار داشت اما پرداخت آن در درگاه زرین‌پال با موفقیت تایید شده است. لطفاً جهت استرداد دستی وجه به خریدار اقدام نمایید.'
+                  : 'این سفارش نیازمند بررسی دستی پیش از ارسال است.'}
+              </p>
+            </div>
+          </div>
+        )}
+
         {/* Status Change Selector Bar */}
         <div className="p-4 rounded-2xl bg-[#E4F5FF]/50 border border-[#BFDDF0] flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
           <span className="font-semibold text-[#111110]">
@@ -228,6 +279,47 @@ export const OrderDetailModal: React.FC<OrderDetailModalProps> = ({
               >
                 تایید لغو
               </button>
+            </div>
+          </div>
+        )}
+
+        {/* Manual PAID Confirmation for Gateway Orders without RefID (B6) */}
+        {isConfirmingManualPaid && (
+          <div className="p-4 rounded-xl border border-amber-300 bg-amber-50 text-xs space-y-3 animate-in fade-in">
+            <div className="flex items-start gap-2 text-amber-900">
+              <AlertTriangle className="w-5 h-5 shrink-0 text-amber-700 mt-0.5" />
+              <div>
+                <div className="font-bold">تایید دستی پرداخت برای سفارش درگاهی فاقد RefID</div>
+                <p className="mt-1 text-amber-800 leading-relaxed">
+                  این سفارش با روش درگاه اینترنتی ثبت شده اما هنوز کد پیگیری زرین‌پال (RefID) ندارد. تغییر دستی به «پرداخت شده» در لاگ امنیتی ثبت و سفارش جهت بررسی علامت‌گذاری می‌شود.
+                </p>
+              </div>
+            </div>
+            <div className="flex flex-col sm:flex-row gap-2">
+              <input
+                type="text"
+                value={manualPaidReasonInput}
+                onChange={(e) => setManualPaidReasonInput(e.target.value)}
+                placeholder="دلیل و شماره پیگیری بانکی یا فیش جایگزین را بنویسید..."
+                className="flex-1 px-3 py-2 rounded-lg border border-amber-300 bg-white text-[#111110]"
+              />
+              <div className="flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsConfirmingManualPaid(false)}
+                  className="px-3 py-2 bg-white border border-amber-300 rounded-lg"
+                >
+                  انصراف
+                </button>
+                <button
+                  type="button"
+                  disabled={manualPaidReasonInput.trim().length < 3}
+                  onClick={handleConfirmManualPaid}
+                  className="px-3 py-2 bg-amber-700 text-white rounded-lg font-bold disabled:opacity-50"
+                >
+                  تایید نهایی پرداخت دستی
+                </button>
+              </div>
             </div>
           </div>
         )}

@@ -20,7 +20,11 @@ import {
 
 interface AdminOrdersProps {
   orders: Order[];
-  onUpdateStatus: (orderId: string, status: OrderStatus) => Promise<void>;
+  onUpdateStatus: (
+    orderId: string,
+    status: OrderStatus,
+    extra?: { confirmManualPaid?: boolean; reason?: string }
+  ) => Promise<void>;
   onDeleteOrder: (orderId: string) => Promise<void>;
   dark?: boolean;
 }
@@ -456,6 +460,18 @@ export const AdminOrders: React.FC<AdminOrdersProps> = ({
                           <option value="RETURNED">مرجوع شده</option>
                           <option value="REFUNDED">مسترد شده</option>
                         </select>
+                        {order.needsReview && (
+                          <div className="mt-1 inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-100 text-red-700 border border-red-300 text-[10px] font-bold">
+                            <span>نیاز به بررسی</span>
+                            <span>
+                              ({order.reviewReason === 'INSUFFICIENT_STOCK'
+                                ? 'کسری موجودی'
+                                : order.reviewReason === 'PAID_AFTER_CANCEL'
+                                ? 'پرداخت پس از لغو'
+                                : order.reviewReason || 'حساس'})
+                            </span>
+                          </div>
+                        )}
                       </td>
 
                       {/* Actions */}

@@ -445,9 +445,13 @@ export const AdminPanel: React.FC<AdminPanelProps> = ({
   };
 
   // Handlers for Orders
-  const handleUpdateOrderStatus = async (orderId: string, status: OrderStatus) => {
+  const handleUpdateOrderStatus = async (
+    orderId: string,
+    status: OrderStatus,
+    extra?: { confirmManualPaid?: boolean; reason?: string }
+  ) => {
     try {
-      const updated = await adminApi.updateOrderStatus(orderId, status);
+      const updated = await adminApi.updateOrderStatus(orderId, status, extra);
       setOrders((prev) => prev.map((o) => (o.id === orderId ? updated : o)));
       if (inspectingOrder && inspectingOrder.id === orderId) {
         setInspectingOrder(updated);

@@ -29,6 +29,7 @@ export interface PaymentCallbackResult {
   orderNumber?: string;
   reason?: string;
   message?: string;
+  errorStatus?: number;
   order?: Order | null;
   loading?: boolean;
 }
@@ -294,8 +295,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
           'morico_pending_payment',
           JSON.stringify({
             orderNumber: pendingOrder.orderNumber,
-            paymentToken: pendingOrder.paymentToken,
-            phone: phone.trim()
+            paymentToken: pendingOrder.paymentToken
           })
         );
       } catch {}
@@ -305,8 +305,7 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         orderNumber: pendingOrder.orderNumber,
         orderId: pendingOrder.id,
         idempotencyKey: `${idempotencyKeyRef.current}-pay`,
-        paymentToken: pendingOrder.paymentToken,
-        phone: phone.trim()
+        paymentToken: pendingOrder.paymentToken
       });
 
       setPaymentPhase('redirecting');
@@ -553,21 +552,39 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
 
     // Failed or Cancelled callback
     const isCancelled = callbackResult.type === 'cancelled';
+    const isPaidAfterCancel = callbackResult.reason === 'paid_after_cancel';
+    const isAuthRequiredForResult =
+      callbackResult.errorStatus === 401 || callbackResult.errorStatus === 403;
+
     return (
       <div className="text-center py-6 space-y-5">
-        <div className="w-16 h-16 bg-rose-100 text-rose-700 rounded-2xl flex items-center justify-center mx-auto shadow-sm">
-          <XCircle className="w-10 h-10" />
+        <div
+          className={`w-16 h-16 rounded-2xl flex items-center justify-center mx-auto shadow-sm ${
+            isPaidAfterCancel
+              ? 'bg-amber-100 text-amber-700'
+              : 'bg-rose-100 text-rose-700'
+          }`}
+        >
+          {isPaidAfterCancel ? <AlertTriangle className="w-10 h-10" /> : <XCircle className="w-10 h-10" />}
         </div>
 
         <div className="space-y-2">
           <h3 className="text-xl font-bold text-[#111110]">
-            {isCancelled ? 'پرداخت توسط شما لغو گردید' : 'پرداخت بانکی تایید نشد'}
+            {isPaidAfterCancel
+              ? 'پرداخت پس از لغو سفارش دریافت شد'
+              : isAuthRequiredForResult
+              ? 'نیاز به استعلام از بخش پیگیری سفارش'
+              : isCancelled
+              ? 'پرداخت توسط شما لغو گردید'
+              : 'پرداخت بانکی تایید نشد'}
           </h3>
           <p className="text-xs text-[#4A5560] max-w-md mx-auto leading-relaxed">
-            {callbackResult.message ||
-              (isCancelled
-                ? 'شما عملیات پرداخت در درگاه زرین‌پال را لغو کردید. سبد خرید شما دست‌نخورده باقی مانده است و می‌توانید مجدداً پرداخت را انجام دهید.'
-                : 'تراکنش در درگاه بانکی با خطا مواجه شد یا تایید نگردید. در صورت کسر وجه از حساب بانکی، مبلغ ظرف ۷۲ ساعت به‌صورت خودکار به حساب شما بازمی‌گردد.')}
+            {isPaidAfterCancel
+              ? 'این سفارش پیش از تکمیل پرداخت در سیستم لغو شده بود، اما تراکنش بانکی شما در درگاه زرین‌پال تایید شده است. سفارش جهت بررسی فوری و استرداد وجه توسط مدیریت ثبت گردید و ارسال نخواهد شد.'
+              : callbackResult.message ||
+                (isCancelled
+                  ? 'شما عملیات پرداخت در درگاه زرین‌پال را لغو کردید. سبد خرید شما دست‌نخورده باقی مانده است و می‌توانید مجدداً پرداخت را انجام دهید.'
+                  : 'تراکنش در درگاه بانکی با خطا مواجه شد یا تایید نگردید. در صورت کسر وجه از حساب بانکی، مبلغ ظرف ۷۲ ساعت به‌صورت خودکار به حساب شما بازمی‌گردد.')}
           </p>
           {callbackResult.orderNumber && (
             <div className="text-xs font-mono font-semibold text-[#4A5560]">
@@ -577,7 +594,18 @@ export const CheckoutModal: React.FC<CheckoutModalProps> = ({
         </div>
 
         <div className="flex flex-col sm:flex-row items-center justify-center gap-3 pt-2">
-          {callbackResult.order && onRetryCallbackOrder ? (
+          {(isAuthRequiredForResult || isPaidAfterCancel) && onNavigateToTracking ? (
+            <button
+              type="button"
+              onClick={() => {
+                if (onClearCallbackResult) onClearCallbackResult();
+                onNavigateToTracking();
+              }}
+              className="w-full sm:w-auto px-6 py-3 rounded-xl bg-[#111110] text-white hover:bg-black text-xs font-semibold cursor-pointer"
+            >
+              پیگیری سفارش با شماره سفارش و موبایل
+            </button>
+          ) : callbackResult.order && onRetryCallbackOrder && !isPaidAfterCancel ? (
             <button
               type="button"
               disabled={isCallbackActionBusy}

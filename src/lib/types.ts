@@ -97,6 +97,9 @@ export interface Product {
   colors?: ProductColor[];
   sizes?: string[];
   customizable?: boolean;
+  allowCustomization?: boolean;
+  isCustomizable?: boolean;
+  customizationFee?: number;
   views?: ProductView[];
   details?: string[] | any;
   material?: string;
@@ -292,6 +295,11 @@ export interface Order {
   idempotencyKey?: string;
   paymentToken?: string;
   customization?: CustomizationData;
+  needsReview?: boolean;
+  reviewReason?: string;
+  promoCounted?: boolean;
+  manuallyMarkedPaid?: boolean;
+  manualPaidReason?: string;
 }
 
 export interface DiscountCode {

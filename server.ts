@@ -17,6 +17,8 @@ import {
   verifyDummyPasswordAsync,
   toEnglishDigits,
   cleanPhoneNumber,
+  normalizeIranianMobile,
+  normalizeAndValidateEmail,
   sanitizeText,
   signJoseToken,
   verifyJoseToken,
@@ -40,6 +42,7 @@ import {
   DATA_FILE,
   AUDIT_LOG_FILE,
   UPLOADS_DIR,
+  DESIGN_UPLOADS_DIR,
   recordAuditLog,
   getRecentAuditLogs,
   loadAuditLogs,
@@ -65,7 +68,13 @@ import {
   isValidOrderStatusTransition,
   isCancelledOrderStatus,
   isPaidOrFulfilledOrderStatus,
+  isProductCustomizable,
+  getProductCustomizationFee,
+  evaluateDiscountCode,
   sanitizeOrderInput,
+  sanitizeCategoryInput,
+  sanitizeProductInput,
+  sanitizeDiscountInput,
   OrderStatus
 } from './src/server/schema';
 
@@ -92,25 +101,60 @@ const REQUIRE_ADMIN_MFA = process.env.REQUIRE_ADMIN_MFA === 'true';
 let ADMIN_PASSWORD = process.env.ADMIN_PASSWORD;
 let SESSION_SECRET = process.env.SESSION_SECRET;
 
-// Fail-Fast: Halt execution immediately if mandatory secrets are insecure in production
-if (isProduction) {
-  if (!ADMIN_PASSWORD || ADMIN_PASSWORD === 'morico2026' || ADMIN_PASSWORD === 'morico1234') {
-    console.error('================================================================');
-    console.error('FATAL PRODUCTION SECURITY ERROR: ADMIN_PASSWORD is missing or set');
-    console.error('to an insecure default. You must configure a secure ADMIN_PASSWORD');
-    console.error('environment variable in production mode (OWASP ASVS V2.1).');
-    console.error('================================================================');
-    process.exit(1);
+export function validateProductionEnvironment(env: NodeJS.ProcessEnv = process.env): { ok: true } | { ok: false; error: string } {
+  const modeEnv = (env.ZARINPAL_MODE || '').trim().toLowerCase();
+  const isProdEnv = env.NODE_ENV === 'production';
+
+  if (modeEnv === 'production' && !isProdEnv) {
+    return {
+      ok: false,
+      error:
+        'FATAL PRODUCTION SECURITY ERROR: ZARINPAL_MODE=production requires NODE_ENV=production. Refusing to start in non-production mode with live gateway configuration.'
+    };
   }
-  if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
-    console.error('================================================================');
-    console.error('FATAL PRODUCTION SECURITY ERROR: SESSION_SECRET is missing or');
-    console.error('has fewer than 32 characters. Provide a high-entropy secret');
-    console.error('via SESSION_SECRET environment variable (OWASP ASVS V6.1).');
-    console.error('================================================================');
-    process.exit(1);
+
+  if (isProdEnv) {
+    const adminPass = env.ADMIN_PASSWORD;
+    const sessSecret = env.SESSION_SECRET;
+    if (!adminPass || adminPass === 'morico2026' || adminPass === 'morico1234') {
+      return {
+        ok: false,
+        error:
+          'FATAL PRODUCTION SECURITY ERROR: ADMIN_PASSWORD is missing or set to an insecure default (OWASP ASVS V2.1).'
+      };
+    }
+    if (!sessSecret || sessSecret.length < 32) {
+      return {
+        ok: false,
+        error:
+          'FATAL PRODUCTION SECURITY ERROR: SESSION_SECRET is missing or has fewer than 32 characters (OWASP ASVS V6.1).'
+      };
+    }
+    const explicitCb = (env.ZARINPAL_CALLBACK_URL || '').trim();
+    const appBase = (env.APP_BASE_URL || '').trim().replace(/\/+$/, '');
+    const hasValidCallback = Boolean(explicitCb && /^https:\/\//i.test(explicitCb));
+    const hasValidBase = Boolean(appBase && /^https:\/\//i.test(appBase));
+    if (!hasValidCallback && !hasValidBase) {
+      return {
+        ok: false,
+        error:
+          'FATAL PRODUCTION SECURITY ERROR: Either APP_BASE_URL (starting with https://) or ZARINPAL_CALLBACK_URL (starting with https://) must be configured in production mode.'
+      };
+    }
   }
-} else {
+
+  return { ok: true };
+}
+
+const envCheck = validateProductionEnvironment(process.env);
+if ('error' in envCheck) {
+  console.error('================================================================');
+  console.error(envCheck.error);
+  console.error('================================================================');
+  process.exit(1);
+}
+
+if (!isProduction) {
   if (!SESSION_SECRET || SESSION_SECRET.length < 32) {
     SESSION_SECRET = crypto.randomBytes(32).toString('hex');
   }
@@ -499,25 +543,29 @@ export function getEffectiveGatewayConfig() {
   };
 }
 
-function getCallbackUrl(req: Request): string {
+export function getCallbackUrl(req?: Request): string {
   const explicit = (process.env.ZARINPAL_CALLBACK_URL || '').trim();
-  if (explicit && /^https?:\/\//i.test(explicit)) {
+  const urlProtoPattern = isProduction ? /^https:\/\//i : /^https?:\/\//i;
+  if (explicit && urlProtoPattern.test(explicit)) {
     return explicit;
   }
   const appBase = (process.env.APP_BASE_URL || '').trim().replace(/\/+$/, '');
-  if (appBase && /^https?:\/\//i.test(appBase)) {
+  if (appBase && urlProtoPattern.test(appBase)) {
     return `${appBase}/api/payments/zarinpal/callback`;
   }
+  if (isProduction) {
+    throw new Error('Production requires HTTPS APP_BASE_URL or ZARINPAL_CALLBACK_URL');
+  }
   const forwardedProto =
-    typeof req.headers['x-forwarded-proto'] === 'string'
+    req && typeof req.headers['x-forwarded-proto'] === 'string'
       ? req.headers['x-forwarded-proto'].split(',')[0].trim()
       : '';
-  const protocol = forwardedProto || req.protocol || 'http';
+  const protocol = forwardedProto || req?.protocol || 'http';
   const forwardedHost =
-    typeof req.headers['x-forwarded-host'] === 'string'
+    req && typeof req.headers['x-forwarded-host'] === 'string'
       ? req.headers['x-forwarded-host'].split(',')[0].trim()
       : '';
-  const host = forwardedHost || req.get('host') || `localhost:${PORT}`;
+  const host = forwardedHost || req?.get('host') || `localhost:${PORT}`;
   return `${protocol}://${host}/api/payments/zarinpal/callback`;
 }
 
@@ -569,7 +617,7 @@ async function isAuthorizedForOrderPayment(req: Request, order: any): Promise<bo
     }
   }
 
-  // 2. Customer or Admin session JWT
+  // 2. Customer or Admin session JWT (no raw phone fallback allowed - B2)
   const sessionToken = extractBearerOrCookieToken(req);
   if (sessionToken) {
     const userPayload = await verifyJoseToken(
@@ -587,13 +635,6 @@ async function isAuthorizedForOrderPayment(req: Request, order: any): Promise<bo
         return true;
       }
     }
-  }
-
-  // 3. Matching customer phone (last 10 digits) provided explicitly
-  const providedPhone = cleanPhoneNumber(String(req.body?.phone || req.query?.phone || '')).slice(-10);
-  const orderPhoneSuffix = cleanPhoneNumber(order.customerPhone || '').slice(-10);
-  if (providedPhone.length === 10 && orderPhoneSuffix.length === 10 && providedPhone === orderPhoneSuffix) {
-    return true;
   }
 
   return false;
@@ -627,29 +668,54 @@ function checkOrderItemsStock(order: any): { ok: true } | { ok: false; error: st
 
 function decrementOrderInventoryOnce(order: any, actorIp = '127.0.0.1'): boolean {
   if (order.inventoryDeducted) return false;
+  const shortages: string[] = [];
+
   for (const it of order.items || []) {
     const pid = it.productId || it.product?.id;
     const qty = Math.max(1, Number(it.quantity) || 1);
     const prod = dbProducts.find((p) => p.id === pid);
-    if (!prod) continue;
+    if (!prod) {
+      shortages.push(`محصول ${it.product?.name || pid} (یافت نشد)`);
+      continue;
+    }
     if (it.selectedVariantId && Array.isArray(prod.variants)) {
       const variant = prod.variants.find((v: any) => v.id === it.selectedVariantId);
-      if (variant && typeof variant.stock === 'number') {
+      if (!variant) {
+        shortages.push(`${prod.name} - تنوع ناموجود`);
+      } else if (typeof variant.stock === 'number') {
+        if (variant.stock < qty) {
+          shortages.push(`${prod.name} (${variant.title || variant.id}): نیاز ${qty}، موجود ${variant.stock}`);
+        }
         variant.stock = Math.max(0, variant.stock - qty);
       }
+    } else if (typeof prod.stock === 'number' && prod.stock < qty) {
+      shortages.push(`${prod.name}: نیاز ${qty}، موجود ${prod.stock}`);
     }
     if (typeof prod.stock === 'number') {
       prod.stock = Math.max(0, prod.stock - qty);
     }
   }
+
   order.inventoryDeducted = true;
   order.inventoryDeductedAt = new Date().toISOString();
-  recordAuditLog({
-    event: 'INVENTORY_DECREMENTED',
-    ip: actorIp,
-    details: `موجودی انبار برای سفارش ${order.orderNumber} پس از تایید قطعی پرداخت کسر گردید.`,
-    severity: 'info'
-  });
+
+  if (shortages.length > 0) {
+    order.needsReview = true;
+    order.reviewReason = order.reviewReason || 'INSUFFICIENT_STOCK';
+    recordAuditLog({
+      event: 'INVENTORY_DECREMENTED',
+      ip: actorIp,
+      details: `هشدار کسری موجودی پس از تایید پرداخت سفارش ${order.orderNumber} (INSUFFICIENT_STOCK): ${shortages.join(' | ')}`,
+      severity: 'critical'
+    });
+  } else {
+    recordAuditLog({
+      event: 'INVENTORY_DECREMENTED',
+      ip: actorIp,
+      details: `موجودی انبار برای سفارش ${order.orderNumber} پس از تایید قطعی پرداخت کسر گردید.`,
+      severity: 'info'
+    });
+  }
   return true;
 }
 
@@ -671,6 +737,18 @@ function restoreOrderInventoryOnce(order: any): boolean {
     }
   }
   order.inventoryDeducted = false;
+  return true;
+}
+
+function releaseOrderPromoCountOnce(order: any): boolean {
+  if (!order.promoCode || !order.promoCounted) return false;
+  const promoCodeUpper = String(order.promoCode).trim().toUpperCase();
+  const disc = dbDiscounts.find((d) => String(d.code || '').trim().toUpperCase() === promoCodeUpper);
+  if (disc) {
+    const cur = Number(disc.usedCount ?? disc.usageCount ?? 0);
+    disc.usedCount = Math.max(0, cur - 1);
+  }
+  order.promoCounted = false;
   return true;
 }
 
@@ -891,13 +969,16 @@ app.use((req, res, next) => {
   next();
 });
 
-// Selective Body Parsing: 10MB only on upload endpoint, strict 100KB on everything else
+// Selective Body Parsing: 10MB on upload endpoint, 5MB on POST /api/orders (design images saved to disk), strict 100KB elsewhere
 const standardJsonParser = express.json({ limit: '100kb' });
+const orderJsonParser = express.json({ limit: '5mb' });
 const uploadJsonParser = express.json({ limit: '10mb' });
 
 app.use((req, res, next) => {
   if (req.path === '/api/upload') {
     uploadJsonParser(req, res, next);
+  } else if (req.path === '/api/orders' && req.method === 'POST') {
+    orderJsonParser(req, res, next);
   } else {
     standardJsonParser(req, res, next);
   }
@@ -1607,6 +1688,20 @@ app.get('/api/content', (req, res) => {
   res.json(dbSiteContent);
 });
 
+// Health endpoint for cPanel / uptime monitoring without exposing any secrets or merchantId (C5)
+app.get('/api/health', (req, res) => {
+  const effective = getEffectiveGatewayConfig();
+  res.json({
+    ok: true,
+    status: 'healthy',
+    uptime: Math.floor(process.uptime()),
+    timestamp: new Date().toISOString(),
+    env: process.env.NODE_ENV || 'development',
+    mode: effective.mode,
+    gatewayReady: effective.ready
+  });
+});
+
 // Payment status: Hides merchantId from public clients (OWASP ASVS V13.2)
 app.get('/api/payments/status', (req, res) => {
   const effective = getEffectiveGatewayConfig();
@@ -1626,36 +1721,16 @@ app.post('/api/discounts/validate', createDiscountRateLimiter(15, 5 * 60 * 1000)
     return res.status(400).json({ valid: false, error: 'کد تخفیف را وارد فرمایید.' });
   }
 
-  const cleanCode = code.trim().toUpperCase();
-  const found = dbDiscounts.find((d) => d.code === cleanCode && d.active !== false);
-
-  if (!found) {
-    return res.json({ valid: false, error: 'کد تخفیف معتبر نیست یا منقضی شده است.' });
-  }
-
-  const sub = Number(subtotal) || 0;
-  if (found.minOrderAmount && sub < found.minOrderAmount) {
-    return res.json({
-      valid: false,
-      error: `حداقل مبلغ خرید برای این کد ${found.minOrderAmount.toLocaleString('fa-IR')} تومان است.`
-    });
-  }
-
-  let discountAmount = 0;
-  if (found.type === 'percentage') {
-    discountAmount = Math.round((sub * found.amount) / 100);
-    if (found.maxDiscountAmount && discountAmount > found.maxDiscountAmount) {
-      discountAmount = found.maxDiscountAmount;
-    }
-  } else {
-    discountAmount = Math.min(found.amount, sub);
+  const evalRes = evaluateDiscountCode(dbDiscounts, code, Number(subtotal) || 0);
+  if ('error' in evalRes) {
+    return res.json({ valid: false, error: evalRes.error });
   }
 
   res.json({
     valid: true,
-    code: found.code,
-    discountAmount,
-    description: found.description
+    code: evalRes.code,
+    discountAmount: evalRes.discountAmount,
+    description: evalRes.description
   });
 });
 
@@ -1707,7 +1782,142 @@ app.get('/api/reverse-geocode', async (req, res) => {
 // ============================================================================
 // 3. ORDER PLACEMENT & TAMPERING DEFENSE (OWASP ASVS V10.2, V10.3, V13.2)
 // ============================================================================
-app.post('/api/orders', async (req, res) => {
+const orderCreationRateLimiter = createGeneralRateLimiter(10, 10 * 60 * 1000, 'rate_limit_order_create');
+
+async function persistSafeDesignImageDataUrl(
+  dataUrl: string,
+  dedupeCache: Map<string, string>,
+  ip: string
+): Promise<string> {
+  if (!dataUrl || typeof dataUrl !== 'string') return dataUrl;
+  const trimmed = dataUrl.trim();
+  if (!trimmed.startsWith('data:image/')) {
+    return trimmed;
+  }
+  const existing = dedupeCache.get(trimmed);
+  if (existing) return existing;
+
+  const match = trimmed.match(/^data:image\/([a-zA-Z0-9+.-]+);base64,(.+)$/);
+  if (!match) {
+    throw new Error('فرمت تصویر طراحی اختصاصی نامعتبر است.');
+  }
+
+  const buffer = Buffer.from(match[2], 'base64');
+  if (buffer.length > 5 * 1024 * 1024) {
+    throw new Error('حجم هر تصویر طراحی اختصاصی نباید بیشتر از ۵ مگابایت باشد.');
+  }
+
+  const textSample = buffer.slice(0, 120).toString('utf8').trim().toLowerCase();
+  if (textSample.startsWith('<svg') || textSample.includes('<?xml') || textSample.includes('<svg')) {
+    recordAuditLog({
+      event: 'MALICIOUS_UPLOAD_BLOCKED',
+      ip,
+      details: 'تلاش برای ثبت فایل SVG درون طراحی سفارش مسدود شد.',
+      severity: 'critical'
+    });
+    throw new Error('فرمت SVG در طراحی اختصاصی مجاز نیست.');
+  }
+
+  let detectedExt: 'jpeg' | 'png' | 'webp' | null = null;
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) {
+    detectedExt = 'jpeg';
+  } else if (
+    buffer.length >= 8 &&
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47
+  ) {
+    detectedExt = 'png';
+  } else if (
+    buffer.length >= 12 &&
+    buffer.slice(0, 4).toString('ascii') === 'RIFF' &&
+    buffer.slice(8, 12).toString('ascii') === 'WEBP'
+  ) {
+    detectedExt = 'webp';
+  }
+
+  if (!detectedExt) {
+    throw new Error('امضای فایل تصویر طراحی اختصاصی معتبر نیست.');
+  }
+
+  let cleanBuffer: Buffer;
+  try {
+    cleanBuffer = await sharp(buffer).toFormat(detectedExt, { quality: 88 }).toBuffer();
+  } catch {
+    throw new Error('ساختار تصویر طراحی اختصاصی معیوب یا نامعتبر است.');
+  }
+
+  if (!fs.existsSync(DESIGN_UPLOADS_DIR)) {
+    fs.mkdirSync(DESIGN_UPLOADS_DIR, { recursive: true });
+  }
+  const safeFilename = `design_${Date.now()}_${crypto.randomBytes(8).toString('hex')}.${detectedExt}`;
+  const safePath = path.join(DESIGN_UPLOADS_DIR, safeFilename);
+  const resolvedBase = path.resolve(UPLOADS_DIR) + path.sep;
+  if (!path.resolve(safePath).startsWith(resolvedBase)) {
+    throw new Error('خطای امنیت مسیر ذخیره‌سازی طراحی.');
+  }
+
+  fs.writeFileSync(safePath, cleanBuffer);
+  const publicUrl = `/uploads/designs/${safeFilename}`;
+  dedupeCache.set(trimmed, publicUrl);
+  return publicUrl;
+}
+
+async function persistCustomizationDataImages(customization: any, ip: string): Promise<any> {
+  if (!customization || typeof customization !== 'object') return customization;
+  const dedupeCache = new Map<string, string>();
+  const cloned = JSON.parse(JSON.stringify(customization));
+
+  if (typeof cloned.designImageUrl === 'string') {
+    cloned.designImageUrl = await persistSafeDesignImageDataUrl(cloned.designImageUrl, dedupeCache, ip);
+  }
+  if (typeof cloned.previewMockupUrl === 'string') {
+    cloned.previewMockupUrl = await persistSafeDesignImageDataUrl(cloned.previewMockupUrl, dedupeCache, ip);
+  }
+
+  if (Array.isArray(cloned.layers)) {
+    for (const layer of cloned.layers) {
+      if (layer && typeof layer === 'object') {
+        if (typeof layer.content === 'string') {
+          layer.content = await persistSafeDesignImageDataUrl(layer.content, dedupeCache, ip);
+        }
+        if (typeof layer.originalImage === 'string') {
+          layer.originalImage = await persistSafeDesignImageDataUrl(layer.originalImage, dedupeCache, ip);
+        }
+      }
+    }
+  }
+
+  if (cloned.views && typeof cloned.views === 'object') {
+    for (const vKey of Object.keys(cloned.views)) {
+      const view = cloned.views[vKey];
+      if (!view || typeof view !== 'object') continue;
+      if (typeof view.designImageUrl === 'string') {
+        view.designImageUrl = await persistSafeDesignImageDataUrl(view.designImageUrl, dedupeCache, ip);
+      }
+      if (typeof view.previewMockupUrl === 'string') {
+        view.previewMockupUrl = await persistSafeDesignImageDataUrl(view.previewMockupUrl, dedupeCache, ip);
+      }
+      if (Array.isArray(view.layers)) {
+        for (const layer of view.layers) {
+          if (layer && typeof layer === 'object') {
+            if (typeof layer.content === 'string') {
+              layer.content = await persistSafeDesignImageDataUrl(layer.content, dedupeCache, ip);
+            }
+            if (typeof layer.originalImage === 'string') {
+              layer.originalImage = await persistSafeDesignImageDataUrl(layer.originalImage, dedupeCache, ip);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return cloned;
+}
+
+app.post('/api/orders', orderCreationRateLimiter, async (req, res) => {
   const sanitized = sanitizeOrderInput(req.body);
   if ('error' in sanitized) {
     return res.status(400).json({ error: sanitized.error });
@@ -1743,6 +1953,18 @@ app.post('/api/orders', async (req, res) => {
       });
       return res.status(200).json({ ...existingPending, paymentToken });
     }
+  }
+
+  // Max 3 concurrent open PENDING_PAYMENT orders per normalized mobile number (B3)
+  const openPendingCount = dbOrders.filter(
+    (o) =>
+      o.status === 'PENDING_PAYMENT' &&
+      normalizeIranianMobile(o.customerPhone) === sanitized.customerPhone
+  ).length;
+  if (openPendingCount >= 3) {
+    return res.status(429).json({
+      error: 'حداکثر ۳ سفارش هم‌زمان در انتظار پرداخت برای هر شماره موبایل مجاز است. لطفاً ابتدا سفارش‌های قبلی خود را تکمیل یا لغو فرمایید.'
+    });
   }
 
   let calculatedSubtotal = 0;
@@ -1787,20 +2009,34 @@ app.post('/api/orders', async (req, res) => {
 
     const unitPrice = discPrice > 0 && discPrice < basePrice ? discPrice : basePrice;
 
-    // Customization fee validation
+    // Customization fee validation (A1: strictly computed on server; client customFee ignored)
     let customFee = 0;
-    const isCustomizable = Boolean(foundProduct.customizable || foundProduct.allowCustomization);
-    if (isCustomizable && item.customization?.customFee) {
-      const rawFee = Number(item.customization.customFee);
-      if (rawFee > 0 && rawFee <= 500000) {
-        customFee = rawFee;
+    const customizable = isProductCustomizable(foundProduct);
+    if (item.customization) {
+      if (!customizable) {
+        return res.status(400).json({
+          error: `محصول «${foundProduct.name}» قابلیت طراحی اختصاصی و چاپ آنلاین ندارد.`
+        });
       }
+      customFee = getProductCustomizationFee(foundProduct);
     }
 
     const itemTotal = (unitPrice + customFee) * item.quantity;
     calculatedSubtotal += itemTotal;
 
     const productImage = foundProduct.image || foundProduct.imageUrl || foundProduct.images?.[0] || '';
+
+    let persistedCustomization: any = undefined;
+    if (item.customization) {
+      try {
+        const savedCust = await persistCustomizationDataImages(item.customization, req.ip || '127.0.0.1');
+        persistedCustomization = { ...savedCust, customFee };
+      } catch (imgErr: any) {
+        return res.status(400).json({
+          error: imgErr?.message || 'پردازش تصویر طراحی اختصاصی با خطا مواجه شد.'
+        });
+      }
+    }
 
     verifiedItems.push({
       productId: foundProduct.id,
@@ -1825,44 +2061,22 @@ app.post('/api/orders', async (req, res) => {
       quantity: item.quantity,
       selectedColor: item.selectedColor,
       selectedSize: item.selectedSize,
-      customization: item.customization,
+      customization: persistedCustomization,
       unitPrice,
       customFee,
       itemTotal
     });
   }
 
-  // Server-side Discount Promo Evaluation (aligned with cartUtils.ts)
+  // Server-side Discount Promo Evaluation (A7: validated now, quota incremented ONLY on successful payment)
   let calculatedDiscount = 0;
   let promoCodeApplied = '';
 
   if (sanitized.promoCode) {
-    const codeStr = sanitized.promoCode.trim().toUpperCase();
-    const foundDiscount = dbDiscounts.find((d) => d.code === codeStr && d.active !== false);
-    if (foundDiscount) {
-      const expiry = foundDiscount.expiresAt || foundDiscount.expiryDate;
-      const isExpired = expiry ? new Date(expiry).getTime() < Date.now() : false;
-      const maxUses = foundDiscount.maxUses ?? foundDiscount.usageLimit;
-      const usedCount = foundDiscount.usedCount ?? foundDiscount.usageCount ?? 0;
-      const isExhausted = maxUses !== undefined && maxUses > 0 && usedCount >= maxUses;
-
-      if (!isExpired && !isExhausted && (!foundDiscount.minOrderAmount || calculatedSubtotal >= foundDiscount.minOrderAmount)) {
-        const isPercentage =
-          foundDiscount.type === 'percentage' || (foundDiscount.percent && !foundDiscount.amount);
-        const rate = Number(foundDiscount.amount ?? foundDiscount.percent ?? 0);
-
-        if (isPercentage) {
-          calculatedDiscount = Math.round((calculatedSubtotal * rate) / 100);
-          if (foundDiscount.maxDiscountAmount && calculatedDiscount > foundDiscount.maxDiscountAmount) {
-            calculatedDiscount = foundDiscount.maxDiscountAmount;
-          }
-        } else {
-          calculatedDiscount = Math.min(rate, calculatedSubtotal);
-        }
-        calculatedDiscount = Math.min(calculatedDiscount, calculatedSubtotal);
-        promoCodeApplied = foundDiscount.code;
-        foundDiscount.usedCount = usedCount + 1;
-      }
+    const promoEval = evaluateDiscountCode(dbDiscounts, sanitized.promoCode, calculatedSubtotal);
+    if (promoEval.valid) {
+      calculatedDiscount = promoEval.discountAmount;
+      promoCodeApplied = promoEval.code;
     }
   }
 
@@ -1929,6 +2143,7 @@ app.post('/api/orders', async (req, res) => {
         },
     paymentAttempts: [],
     inventoryDeducted: false,
+    promoCounted: false,
     idempotencyKey: sanitized.idempotencyKey,
     trackingCode
   };
@@ -2015,6 +2230,16 @@ async function finalizeVerifiedOrderPayment(
   }
 
   decrementOrderInventoryOnce(order, ip);
+
+  if (order.promoCode && !order.promoCounted) {
+    const promoCodeUpper = String(order.promoCode).trim().toUpperCase();
+    const disc = dbDiscounts.find((d) => String(d.code || '').trim().toUpperCase() === promoCodeUpper);
+    if (disc) {
+      disc.usedCount = Number(disc.usedCount ?? disc.usageCount ?? 0) + 1;
+    }
+    order.promoCounted = true;
+  }
+
   savePersistentState(true);
 
   recordAuditLog({
@@ -2025,6 +2250,187 @@ async function finalizeVerifiedOrderPayment(
   });
 
   return { ok: true };
+}
+
+let isReconcilerRunning = false;
+
+/**
+ * Background payment reconciler (A6):
+ * 1. Verifies PENDING / AMBIGUOUS attempts aged between 5 minutes and 72 hours via ZarinPal verify.json
+ * 2. Cancels abandoned unpaid orders (24h gateway / 72h card-to-card) and restores counted promo quotas
+ */
+export async function runPaymentReconciler(options?: { nowMs?: number }): Promise<{
+  verified: number;
+  failed: number;
+  expiredCancelled: number;
+  skippedLocked: number;
+}> {
+  if (isReconcilerRunning) {
+    return { verified: 0, failed: 0, expiredCancelled: 0, skippedLocked: 1 };
+  }
+  isReconcilerRunning = true;
+
+  let verified = 0;
+  let failed = 0;
+  let expiredCancelled = 0;
+
+  try {
+    const nowMs = options?.nowMs ?? Date.now();
+    const nowIso = new Date(nowMs).toISOString();
+    const FIVE_MIN_MS = 5 * 60 * 1000;
+    const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
+    const SEVENTY_TWO_HOURS_MS = 72 * 60 * 60 * 1000;
+    const effective = getEffectiveGatewayConfig();
+    let anyMutated = false;
+
+    const orderIds = dbOrders.map((o) => o.id);
+    for (const oid of orderIds) {
+      await withOrderLock(oid, async () => {
+        const order = dbOrders.find((o) => o.id === oid);
+        if (!order) return;
+
+        const attempts: any[] = Array.isArray(order.paymentAttempts) ? order.paymentAttempts : [];
+
+        // 1. Reconcile open PENDING / AMBIGUOUS attempts (5 min .. 72 hours)
+        for (const att of attempts) {
+          if ((att.status !== 'PENDING' && att.status !== 'AMBIGUOUS') || !att.authority) continue;
+          const createdMs = new Date(att.createdAt || order.date || 0).getTime();
+          const ageMs = nowMs - createdMs;
+          if (!Number.isFinite(ageMs) || ageMs < FIVE_MIN_MS || ageMs > SEVENTY_TWO_HOURS_MS) continue;
+
+          if (isPaidOrFulfilledOrderStatus(order.status)) {
+            att.status = 'EXPIRED';
+            att.updatedAt = nowIso;
+            anyMutated = true;
+            continue;
+          }
+
+          if (!isValidMerchantId(effective.merchantId)) continue;
+
+          const verifyMode: ZarinPalMode =
+            att.mode === 'production' || att.mode === 'sandbox' ? att.mode : effective.mode;
+
+          const verifyRes = await verifyZarinPalTransaction({
+            authority: att.authority,
+            amountToman: Number(order.totalAmount ?? order.total ?? 0),
+            merchantId: effective.merchantId,
+            mode: verifyMode
+          });
+
+          if (verifyRes.success) {
+            if (isCancelledOrderStatus(order.status) || order.status === 'REFUNDED' || order.status === 'RETURNED') {
+              att.status = 'SUCCESS';
+              att.refId = verifyRes.refId;
+              att.cardPanMask = verifyRes.cardPan;
+              att.verifyCode = verifyRes.code;
+              att.verifiedAt = nowIso;
+              att.updatedAt = nowIso;
+              order.paymentStatus = 'SUCCESS';
+              order.paidAt = nowIso;
+              order.needsReview = true;
+              order.reviewReason = 'PAID_AFTER_CANCEL';
+              order.paymentInfo = {
+                ...order.paymentInfo,
+                authority: att.authority,
+                refId: verifyRes.refId,
+                cardPanMask: verifyRes.cardPan,
+                paidAt: nowIso,
+                verifiedAt: nowIso
+              };
+              anyMutated = true;
+              recordAuditLog({
+                event: 'PAYMENT_VERIFICATION_SUCCESS',
+                ip: 'reconciler',
+                details: `تطبیق‌دهنده پس‌زمینه پرداخت موفق برای سفارش لغوشده ${order.orderNumber} یافت (PAID_AFTER_CANCEL - RefID: ${verifyRes.refId}).`,
+                severity: 'critical'
+              });
+            } else {
+              await finalizeVerifiedOrderPayment(order, verifyRes, att.authority, 'reconciler');
+            }
+            verified++;
+            anyMutated = true;
+            break;
+          } else if (verifyRes.ambiguous) {
+            att.status = 'AMBIGUOUS';
+            att.errorCode = verifyRes.code;
+            att.errorMessage = verifyRes.message;
+            att.updatedAt = nowIso;
+            anyMutated = true;
+          } else {
+            att.status = att.status === 'PENDING' ? 'EXPIRED' : 'FAILED';
+            att.errorCode = verifyRes.code;
+            att.errorMessage = verifyRes.message;
+            att.updatedAt = nowIso;
+            anyMutated = true;
+            failed++;
+
+            const hasOtherOpenAttempt = attempts.some(
+              (a) => a.id !== att.id && (a.status === 'PENDING' || a.status === 'AMBIGUOUS')
+            );
+            if (!hasOtherOpenAttempt && !isCancelledOrderStatus(order.status) && !isPaidOrFulfilledOrderStatus(order.status)) {
+              order.paymentStatus = 'FAILED';
+              if (isValidOrderStatusTransition(order.status as OrderStatus, 'PAYMENT_FAILED')) {
+                order.status = 'PAYMENT_FAILED';
+              }
+              order.paymentInfo = {
+                ...order.paymentInfo,
+                lastError: verifyRes.message
+              };
+            }
+            recordAuditLog({
+              event: 'PAYMENT_VERIFICATION_FAILED',
+              ip: 'reconciler',
+              details: `تطبیق‌دهنده پس‌زمینه عدم پرداخت سفارش ${order.orderNumber} را تأیید کرد (کد ${verifyRes.code}).`,
+              severity: 'info'
+            });
+          }
+        }
+
+        // 2. Cancel abandoned unpaid orders (gateway > 24h without active ambiguous/success attempt; card > 72h)
+        if (order.status === 'PENDING_PAYMENT' || order.status === 'PAYMENT_FAILED') {
+          const hasSuccess = attempts.some((a) => a.status === 'SUCCESS');
+          const hasActiveAmbiguous = attempts.some((a) => {
+            if (a.status !== 'AMBIGUOUS') return false;
+            const age = nowMs - new Date(a.createdAt || order.date || 0).getTime();
+            return Number.isFinite(age) && age <= SEVENTY_TWO_HOURS_MS;
+          });
+          if (!hasSuccess && !hasActiveAmbiguous) {
+            const isGateway =
+              String(order.paymentMethod || '').includes('درگاه') ||
+              String(order.paymentMethod || '').toLowerCase().includes('zarinpal');
+            const cancelAfterMs = isGateway ? TWENTY_FOUR_HOURS_MS : SEVENTY_TWO_HOURS_MS;
+            const orderAgeMs = nowMs - new Date(order.date || order.paymentInfo?.createdAt || 0).getTime();
+            if (Number.isFinite(orderAgeMs) && orderAgeMs >= cancelAfterMs) {
+              order.status = 'CANCELLED';
+              order.paymentStatus = 'EXPIRED';
+              for (const att of attempts) {
+                if (att.status === 'PENDING' || att.status === 'INITIATED' || att.status === 'AMBIGUOUS') {
+                  att.status = 'EXPIRED';
+                  att.updatedAt = nowIso;
+                }
+              }
+              releaseOrderPromoCountOnce(order);
+              anyMutated = true;
+              expiredCancelled++;
+              recordAuditLog({
+                event: 'ORDER_STATUS_CHANGED',
+                ip: 'reconciler',
+                details: `سفارش رهاشده ${order.orderNumber} پس از گذشت مهلت پرداخت به صورت خودکار لغو گردید.`,
+                severity: 'info'
+              });
+            }
+          }
+        }
+      });
+    }
+
+    if (anyMutated) {
+      savePersistentState(true);
+    }
+    return { verified, failed, expiredCancelled, skippedLocked: 0 };
+  } finally {
+    isReconcilerRunning = false;
+  }
 }
 
 // Initiate ZarinPal v4 Payment Request (Server-Side Amount & Stock Validation)
@@ -2078,6 +2484,47 @@ const handleZarinPalRequest = async (req: Request, res: Response) => {
     const attempts: any[] = Array.isArray(order.paymentAttempts) ? order.paymentAttempts : [];
     order.paymentAttempts = attempts;
 
+    // A8: Before creating any new attempt/Authority, verify existing AMBIGUOUS attempts to prevent double charge
+    const ambiguousAttempts = attempts.filter((att) => att.status === 'AMBIGUOUS' && att.authority);
+    for (const ambAtt of ambiguousAttempts) {
+      const ambMode: ZarinPalMode =
+        ambAtt.mode === 'production' || ambAtt.mode === 'sandbox' ? ambAtt.mode : effective.mode;
+      const ambVerifyRes = await verifyZarinPalTransaction({
+        authority: ambAtt.authority,
+        amountToman: Number(order.totalAmount ?? order.total ?? 0),
+        merchantId: effective.merchantId,
+        mode: ambMode
+      });
+      const ambNow = new Date().toISOString();
+
+      if (ambVerifyRes.success) {
+        await finalizeVerifiedOrderPayment(order, ambVerifyRes, ambAtt.authority, ip);
+        return res.status(409).json({
+          error: 'تراکنش قبلی این سفارش پیش‌تر در درگاه بانکی با موفقیت تایید شده بود و سفارش شما نهایی گردید.',
+          alreadyPaid: true,
+          refId: ambVerifyRes.refId,
+          order: sanitizeOrderPaymentResult(order)
+        });
+      }
+
+      if (ambVerifyRes.ambiguous) {
+        ambAtt.errorCode = ambVerifyRes.code;
+        ambAtt.errorMessage = ambVerifyRes.message;
+        ambAtt.updatedAt = ambNow;
+        savePersistentState(true);
+        return res.status(503).json({
+          error:
+            'تراکنش قبلی این سفارش هنوز در درگاه بانکی در حال بررسی است. برای جلوگیری از پرداخت تکراری، لطفاً دقایقی دیگر وضعیت پرداخت را مجدداً استعلام کنید.',
+          ambiguous: true
+        });
+      }
+
+      ambAtt.status = 'FAILED';
+      ambAtt.errorCode = ambVerifyRes.code;
+      ambAtt.errorMessage = ambVerifyRes.message;
+      ambAtt.updatedAt = ambNow;
+    }
+
     // Idempotency: return active pending attempt if same idempotencyKey or rapid retry (< 25s)
     const nowMs = Date.now();
     const reusableAttempt = attempts.find((att) => {
@@ -2127,14 +2574,16 @@ const handleZarinPalRequest = async (req: Request, res: Response) => {
     const nowIso = new Date().toISOString();
 
     const callbackUrl = effective.callbackUrl || getCallbackUrl(req);
+    const normalizedMobile = normalizeIranianMobile(order.customerPhone) || undefined;
+    const validEmailCheck = normalizeAndValidateEmail(order.customerEmail);
     const reqResult = await requestZarinPalPayment({
       merchantId: effective.merchantId,
       amountToman,
       description: `پرداخت سفارش ${order.orderNumber} - فروشگاه MORICO STYLE`,
       callbackUrl,
       mode: effective.mode,
-      mobile: order.customerPhone,
-      email: order.customerEmail,
+      mobile: normalizedMobile,
+      email: validEmailCheck.valid ? validEmailCheck.value : undefined,
       orderId: order.orderNumber
     });
 
@@ -2270,7 +2719,84 @@ app.get('/api/payments/zarinpal/callback', async (req, res) => {
       });
     };
 
+    const attempts: any[] = Array.isArray(order.paymentAttempts) ? order.paymentAttempts : [];
+    const matchingAttempt = attempts.find((a) => a.authority === authority);
+    const nowIso = new Date().toISOString();
+
     if (isCancelledOrderStatus(order.status) || order.status === 'REFUNDED' || order.status === 'RETURNED') {
+      if (statusParam === 'OK') {
+        const effective = getEffectiveGatewayConfig();
+        const verifyMode: ZarinPalMode =
+          matchingAttempt?.mode === 'production' || matchingAttempt?.mode === 'sandbox'
+            ? matchingAttempt.mode
+            : effective.mode;
+
+        const verifyRes = await verifyZarinPalTransaction({
+          authority,
+          amountToman: Number(order.totalAmount ?? order.total ?? 0),
+          merchantId: effective.merchantId,
+          mode: verifyMode
+        });
+
+        if (verifyRes.success) {
+          if (matchingAttempt) {
+            matchingAttempt.status = 'SUCCESS';
+            matchingAttempt.refId = verifyRes.refId;
+            matchingAttempt.cardPanMask = verifyRes.cardPan;
+            matchingAttempt.cardHash = verifyRes.cardHash;
+            matchingAttempt.feeType = verifyRes.feeType;
+            matchingAttempt.fee = verifyRes.fee;
+            matchingAttempt.verifyCode = verifyRes.code;
+            matchingAttempt.verifiedAt = nowIso;
+            matchingAttempt.updatedAt = nowIso;
+          }
+          order.paymentStatus = 'SUCCESS';
+          order.paidAt = nowIso;
+          order.needsReview = true;
+          order.reviewReason = 'PAID_AFTER_CANCEL';
+          order.paymentInfo = {
+            ...order.paymentInfo,
+            authority,
+            refId: verifyRes.refId,
+            cardPanMask: verifyRes.cardPan,
+            cardHash: verifyRes.cardHash,
+            feeType: verifyRes.feeType,
+            fee: verifyRes.fee,
+            paidAt: nowIso,
+            verifiedAt: nowIso
+          };
+          savePersistentState(true);
+
+          recordAuditLog({
+            event: 'PAYMENT_VERIFICATION_SUCCESS',
+            ip,
+            details: `پرداخت موفق برای سفارش لغوشده ${order.orderNumber} ثبت و تایید شد (PAID_AFTER_CANCEL - RefID: ${verifyRes.refId}). موجودی کسر نشد و نیازمند استرداد دستی است.`,
+            severity: 'critical'
+          });
+
+          await refreshCookie();
+          return res.redirect(`/?payment=failed&reason=paid_after_cancel&orderNumber=${encodeURIComponent(order.orderNumber)}`);
+        }
+
+        if (verifyRes.ambiguous) {
+          if (matchingAttempt) {
+            matchingAttempt.status = 'AMBIGUOUS';
+            matchingAttempt.errorCode = verifyRes.code;
+            matchingAttempt.errorMessage = verifyRes.message;
+            matchingAttempt.updatedAt = nowIso;
+          }
+          savePersistentState(true);
+          recordAuditLog({
+            event: 'PAYMENT_VERIFY_AMBIGUOUS',
+            ip,
+            details: `تایید پرداخت سفارش لغوشده ${order.orderNumber} مبهم ماند.`,
+            severity: 'warning'
+          });
+          await refreshCookie();
+          return res.redirect(`/?payment=pending_verify&orderNumber=${encodeURIComponent(order.orderNumber)}`);
+        }
+      }
+
       await refreshCookie();
       return res.redirect(`/?payment=failed&reason=order_cancelled&orderNumber=${encodeURIComponent(order.orderNumber)}`);
     }
@@ -2279,10 +2805,6 @@ app.get('/api/payments/zarinpal/callback', async (req, res) => {
       await refreshCookie();
       return res.redirect(`/?payment=success&orderNumber=${encodeURIComponent(order.orderNumber)}`);
     }
-
-    const attempts: any[] = Array.isArray(order.paymentAttempts) ? order.paymentAttempts : [];
-    const matchingAttempt = attempts.find((a) => a.authority === authority);
-    const nowIso = new Date().toISOString();
 
     recordAuditLog({
       event: 'PAYMENT_CALLBACK_RECEIVED',
@@ -2526,8 +3048,8 @@ app.post('/api/payments/zarinpal/verify', paymentRateLimiter, async (req, res) =
   });
 });
 
-// Secure Payment Result Lookup after Redirect Callback
-app.get('/api/payments/orders/:orderNumber/result', async (req, res) => {
+// Secure Payment Result Lookup after Redirect Callback (B2: strict token/session auth + rate limit)
+app.get('/api/payments/orders/:orderNumber/result', paymentRateLimiter, async (req, res) => {
   const cleanNum = String(req.params.orderNumber || '').trim().toUpperCase();
   if (!cleanNum) {
     return res.status(400).json({ error: 'شماره سفارش الزامی است.' });
@@ -2542,7 +3064,10 @@ app.get('/api/payments/orders/:orderNumber/result', async (req, res) => {
   }
 
   if (!(await isAuthorizedForOrderPayment(req, order))) {
-    return res.status(403).json({ error: 'برای مشاهده رسید این سفارش، احراز هویت یا شماره تماس ثبت‌شده الزامی است.' });
+    return res.status(401).json({
+      error: 'نشست پرداخت این سفارش در دسترس نیست. لطفاً برای استعلام وضعیت و رسید کامل، از بخش «پیگیری سفارش» با شماره سفارش و موبایل اقدام نمایید.',
+      trackingRequired: true
+    });
   }
 
   return res.json({
@@ -2688,15 +3213,17 @@ app.get('/api/admin/categories', requireAdmin, (req, res) => {
 });
 
 app.post('/api/categories', requireAdmin, (req: AuthenticatedRequest, res) => {
-  const body = req.body || {};
-  if (!body.title) return res.status(400).json({ error: 'عنوان دسته‌بندی الزامی است.' });
+  const sanitized = sanitizeCategoryInput(req.body, true);
+  if ('error' in sanitized) {
+    return res.status(400).json({ error: sanitized.error });
+  }
 
   const newCategory = {
-    ...body,
-    id: body.id || `cat-${Date.now()}`,
-    slug: body.slug || `cat-${Date.now()}`,
+    ...sanitized,
+    id: `cat-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+    slug: sanitized.slug || `cat-${Date.now()}`,
     productCount: 0,
-    active: body.active !== false
+    active: sanitized.active !== false
   };
 
   dbCategories.push(newCategory);
@@ -2718,7 +3245,12 @@ app.put('/api/categories/:id', requireAdmin, (req: AuthenticatedRequest, res) =>
   const cat = dbCategories.find((c) => c.id === id);
   if (!cat) return res.status(404).json({ error: 'دسته‌بندی یافت نشد.' });
 
-  const newParentId = req.body?.parentId;
+  const sanitized = sanitizeCategoryInput(req.body, false);
+  if ('error' in sanitized) {
+    return res.status(400).json({ error: sanitized.error });
+  }
+
+  const newParentId = sanitized.parentId;
   if (newParentId) {
     if (newParentId === id) {
       return res.status(400).json({ error: 'یک دسته‌بندی نمی‌تواند والد خودش باشد.' });
@@ -2737,7 +3269,7 @@ app.put('/api/categories/:id', requireAdmin, (req: AuthenticatedRequest, res) =>
     }
   }
 
-  Object.assign(cat, req.body);
+  Object.assign(cat, sanitized);
   savePersistentState();
 
   recordAuditLog({
@@ -2776,15 +3308,17 @@ app.get('/api/admin/products', requireAdmin, (req, res) => {
 });
 
 app.post('/api/products', requireAdmin, (req: AuthenticatedRequest, res) => {
-  const body = req.body || {};
-  if (!body.name) return res.status(400).json({ error: 'نام محصول الزامی است.' });
+  const sanitized = sanitizeProductInput(req.body, true);
+  if ('error' in sanitized) {
+    return res.status(400).json({ error: sanitized.error });
+  }
 
-  const newProduct = {
-    ...body,
-    id: body.id || `prod-${Date.now()}`,
-    price: Number(body.price) || 0,
-    stock: Math.max(0, Math.floor(Number(body.stock) || 0)),
-    createdAt: new Date().toISOString()
+  const nowIso = new Date().toISOString();
+  const newProduct: Record<string, any> = {
+    ...sanitized,
+    id: `prod-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+    createdAt: nowIso,
+    updatedAt: nowIso
   };
 
   dbProducts.push(newProduct);
@@ -2794,7 +3328,7 @@ app.post('/api/products', requireAdmin, (req: AuthenticatedRequest, res) => {
     event: 'CATALOG_MUTATION',
     username: req.user?.username,
     ip: req.ip || '127.0.0.1',
-    details: `محصول جدید «${newProduct.name}» تعریف گردید.`,
+    details: `محصول جدید «${newProduct.name}» با قیمت ${newProduct.price} و موجودی ${newProduct.stock} تعریف گردید.`,
     severity: 'info'
   });
 
@@ -2806,17 +3340,40 @@ app.put('/api/products/:id', requireAdmin, (req: AuthenticatedRequest, res) => {
   const prod = dbProducts.find((p) => p.id === id);
   if (!prod) return res.status(404).json({ error: 'محصول یافت نشد.' });
 
-  Object.assign(prod, req.body);
-  if (req.body.price !== undefined) prod.price = Number(req.body.price);
-  if (req.body.stock !== undefined) prod.stock = Math.max(0, Math.floor(Number(req.body.stock)));
+  const sanitized = sanitizeProductInput(req.body, false);
+  if ('error' in sanitized) {
+    return res.status(400).json({ error: sanitized.error });
+  }
+
+  const diffs: string[] = [];
+  if (sanitized.price !== undefined && sanitized.price !== prod.price) {
+    diffs.push(`قیمت: ${prod.price} -> ${sanitized.price}`);
+  }
+  if ('discountPrice' in sanitized && sanitized.discountPrice !== prod.discountPrice) {
+    diffs.push(`قیمت تخفیف: ${prod.discountPrice ?? '-'} -> ${sanitized.discountPrice ?? '-'}`);
+  }
+  if (sanitized.stock !== undefined && sanitized.stock !== prod.stock) {
+    diffs.push(`موجودی: ${prod.stock} -> ${sanitized.stock}`);
+  }
+  if ('variants' in sanitized && JSON.stringify(sanitized.variants) !== JSON.stringify(prod.variants)) {
+    const oldCount = Array.isArray(prod.variants) ? prod.variants.length : 0;
+    const newCount = Array.isArray(sanitized.variants) ? sanitized.variants.length : 0;
+    diffs.push(`تنوع‌ها: ${oldCount} -> ${newCount}`);
+  }
+
+  Object.assign(prod, sanitized);
+  prod.updatedAt = new Date().toISOString();
   savePersistentState();
 
   recordAuditLog({
     event: 'CATALOG_MUTATION',
     username: req.user?.username,
     ip: req.ip || '127.0.0.1',
-    details: `محصول «${prod.name}» ویرایش گردید.`,
-    severity: 'info'
+    details:
+      diffs.length > 0
+        ? `محصول «${prod.name}» ویرایش گردید (${diffs.join(' | ')}).`
+        : `محصول «${prod.name}» ویرایش گردید.`,
+    severity: diffs.length > 0 ? 'warning' : 'info'
   });
 
   res.json(prod);
@@ -2848,7 +3405,7 @@ app.get('/api/admin/orders', requireAdmin, (req, res) => {
 
 app.put('/api/orders/:id/status', requireAdmin, async (req: AuthenticatedRequest, res) => {
   const { id } = req.params;
-  const { status } = req.body || {};
+  const { status, confirmManualPaid, reason } = req.body || {};
 
   if (!status || !isValidOrderStatus(status)) {
     return res.status(400).json({ error: 'وضعیت سفارش ارسالی نامعتبر است.' });
@@ -2867,6 +3424,32 @@ app.put('/api/orders/:id/status', requireAdmin, async (req: AuthenticatedRequest
       });
     }
 
+    const isGateway =
+      String(order.paymentMethod || '').includes('درگاه') ||
+      String(order.paymentMethod || '').toLowerCase().includes('zarinpal');
+    const isUnverifiedGatewayManualPaid =
+      status === 'PAID' &&
+      !isPaidOrFulfilledOrderStatus(currentStatus) &&
+      isGateway &&
+      !order.paymentInfo?.refId;
+
+    if (isUnverifiedGatewayManualPaid) {
+      const cleanReason = typeof reason === 'string' ? sanitizeText(reason, 300) : '';
+      if (confirmManualPaid !== true || cleanReason.length < 3) {
+        return res.status(400).json({
+          error:
+            'تغییر دستی وضعیت سفارش درگاهی فاقد کد پیگیری بانکی (RefID) به «پرداخت شده» نیازمند تایید صریح مدیر و ثبت دلیل مشخص است.',
+          requireManualConfirmation: true
+        });
+      }
+      order.manuallyMarkedPaid = true;
+      order.manualPaidReason = cleanReason;
+      order.needsReview = true;
+      if (!order.reviewReason) {
+        order.reviewReason = 'MANUAL_MARKED_PAID';
+      }
+    }
+
     order.status = status;
     if (status === 'PAID') {
       order.paymentStatus = 'SUCCESS';
@@ -2880,6 +3463,7 @@ app.put('/api/orders/:id/status', requireAdmin, async (req: AuthenticatedRequest
     } else if (isCancelledOrderStatus(status) || status === 'REFUNDED') {
       order.paymentStatus = status === 'REFUNDED' ? 'REFUNDED' : 'CANCELLED';
       restoreOrderInventoryOnce(order);
+      releaseOrderPromoCountOnce(order);
     }
 
     savePersistentState(true);
@@ -2888,8 +3472,10 @@ app.put('/api/orders/:id/status', requireAdmin, async (req: AuthenticatedRequest
       event: 'ORDER_STATUS_CHANGED',
       username: req.user?.username,
       ip: req.ip || '127.0.0.1',
-      details: `وضعیت سفارش ${order.orderNumber} از «${currentStatus}» به «${status}» تغییر یافت.`,
-      severity: 'info'
+      details: isUnverifiedGatewayManualPaid
+        ? `ارتقای دستی سفارش درگاهی ${order.orderNumber} از «${currentStatus}» به «PAID» بدون RefID با تایید مدیر انجام شد. دلیل: ${order.manualPaidReason}`
+        : `وضعیت سفارش ${order.orderNumber} از «${currentStatus}» به «${status}» تغییر یافت.`,
+      severity: isUnverifiedGatewayManualPaid ? 'warning' : 'info'
     });
 
     res.json(order);
@@ -2902,14 +3488,15 @@ app.get('/api/admin/discounts', requireAdmin, (req, res) => {
 });
 
 app.post('/api/discounts', requireAdmin, (req: AuthenticatedRequest, res) => {
-  const body = req.body || {};
-  if (!body.code) return res.status(400).json({ error: 'کد تخفیف الزامی است.' });
+  const sanitized = sanitizeDiscountInput(req.body, true);
+  if ('error' in sanitized) {
+    return res.status(400).json({ error: sanitized.error });
+  }
 
-  const newDiscount = {
-    ...body,
-    id: body.id || `disc-${Date.now()}`,
-    code: String(body.code).trim().toUpperCase(),
-    active: body.active !== false,
+  const newDiscount: Record<string, any> = {
+    ...sanitized,
+    id: `disc-${Date.now()}-${crypto.randomBytes(2).toString('hex')}`,
+    active: sanitized.active !== false,
     usedCount: 0
   };
 
@@ -2932,8 +3519,12 @@ app.put('/api/discounts/:id', requireAdmin, (req: AuthenticatedRequest, res) => 
   const disc = dbDiscounts.find((d) => d.id === id);
   if (!disc) return res.status(404).json({ error: 'کد تخفیف یافت نشد.' });
 
-  Object.assign(disc, req.body);
-  if (req.body.code) disc.code = String(req.body.code).trim().toUpperCase();
+  const sanitized = sanitizeDiscountInput(req.body, false);
+  if ('error' in sanitized) {
+    return res.status(400).json({ error: sanitized.error });
+  }
+
+  Object.assign(disc, sanitized);
   savePersistentState();
 
   res.json(disc);
@@ -3185,7 +3776,7 @@ app.post('/api/upload', requireAdmin, async (req: AuthenticatedRequest, res) => 
     const safePath = path.join(UPLOADS_DIR, safeFilename);
 
     // Path traversal verification
-    if (!path.resolve(safePath).startsWith(path.resolve(UPLOADS_DIR))) {
+    if (!path.resolve(safePath).startsWith(path.resolve(UPLOADS_DIR) + path.sep)) {
       return res.status(400).json({ error: 'خطای امنیت مسیر فایل.' });
     }
 
@@ -3306,6 +3897,15 @@ export async function startServer() {
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`MORICO STYLE Core Server running on http://0.0.0.0:${PORT}`);
   });
+
+  // Schedule background payment reconciler every 5 minutes (A6)
+  const reconcilerInterval = setInterval(() => {
+    runPaymentReconciler().catch((err) => {
+      console.warn('[MORICO Reconciler] Background error:', err);
+    });
+  }, 5 * 60 * 1000);
+  reconcilerInterval.unref?.();
+
   return server;
 }
 

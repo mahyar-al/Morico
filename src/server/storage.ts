@@ -3,15 +3,16 @@ import path from 'path';
 import crypto from 'crypto';
 import { cacheSet, cacheGet } from './redisStore';
 
-export const DATA_DIR = path.resolve('data');
+export const DATA_DIR = path.resolve(process.env.DATA_DIR?.trim() || 'data');
 export const BACKUPS_DIR = path.join(DATA_DIR, 'backups');
 export const DATA_FILE = path.join(DATA_DIR, 'morico_store.json');
 export const AUDIT_LOG_FILE = path.join(DATA_DIR, 'audit_logs.jsonl');
 export const REVOKED_TOKENS_FILE = path.join(DATA_DIR, 'revoked_tokens.json');
-export const UPLOADS_DIR = path.resolve('public/uploads');
+export const UPLOADS_DIR = path.resolve(process.env.UPLOADS_DIR?.trim() || 'public/uploads');
+export const DESIGN_UPLOADS_DIR = path.join(UPLOADS_DIR, 'designs');
 
 // Ensure all persistent directories exist
-for (const dir of [DATA_DIR, BACKUPS_DIR, UPLOADS_DIR]) {
+for (const dir of [DATA_DIR, BACKUPS_DIR, UPLOADS_DIR, DESIGN_UPLOADS_DIR]) {
   if (!fs.existsSync(dir)) {
     fs.mkdirSync(dir, { recursive: true });
   }

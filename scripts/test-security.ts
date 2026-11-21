@@ -5,6 +5,8 @@
 
 process.env.NODE_ENV = 'test';
 
+import fs from 'fs';
+import path from 'path';
 import request from 'supertest';
 import {
   app,
@@ -13,11 +15,15 @@ import {
   dbUsers,
   dbDiscounts,
   dbGatewayStatus,
+  validateProductionEnvironment,
+  getCallbackUrl,
   signJoseToken,
   verifyJoseToken,
   SESSION_SECRET
 } from '../server';
 import { computeTotpCode } from '../src/server/totp';
+import { DATA_DIR, DATA_FILE, UPLOADS_DIR, DESIGN_UPLOADS_DIR, getRecentAuditLogs } from '../src/server/storage';
+import { sanitizeProductInput, sanitizeDiscountInput } from '../src/server/schema';
 
 interface TestResult {
   id: number;
@@ -60,7 +66,10 @@ async function runSecurityTestSuite() {
     adminUser.mustChangePassword = false;
   }
   const adminToken = await signJoseToken(adminUser, SESSION_SECRET!);
+  const hadDataFile = fs.existsSync(DATA_FILE);
+  const originalDataSnapshot = hadDataFile ? fs.readFileSync(DATA_FILE, 'utf8') : null;
 
+  try {
   // --------------------------------------------------------------------------
   // سناریو ۱: دستکاری قیمت در ثبت سفارش (رد با ۴۰۰)
   // --------------------------------------------------------------------------
@@ -363,11 +372,23 @@ async function runSecurityTestSuite() {
       .set('Authorization', `Bearer ${adminToken}`)
       .send({ dataUrl: pngBase64 });
 
+    const uploadedRelUrl: string = res9.body?.url || '';
+    const uploadedDiskFile =
+      uploadedRelUrl.startsWith('/uploads/') ? path.join(UPLOADS_DIR, path.basename(uploadedRelUrl)) : '';
+    const fileWasCreated = Boolean(uploadedDiskFile && fs.existsSync(uploadedDiskFile));
+
     const passed9 =
       res9.status === 200 &&
-      typeof res9.body?.url === 'string' &&
-      res9.body.url.startsWith('/uploads/media_') &&
-      res9.body.url.endsWith('.png');
+      typeof uploadedRelUrl === 'string' &&
+      uploadedRelUrl.startsWith('/uploads/media_') &&
+      uploadedRelUrl.endsWith('.png') &&
+      fileWasCreated;
+
+    if (uploadedDiskFile && fs.existsSync(uploadedDiskFile)) {
+      try {
+        fs.unlinkSync(uploadedDiskFile);
+      } catch {}
+    }
 
     recordTest(
       9,
@@ -375,7 +396,7 @@ async function runSecurityTestSuite() {
       'V12.2 / V12.3',
       'L1',
       passed9,
-      `کد: ${res9.status} - آدرس ذخیره‌شده: ${res9.body?.url}`
+      `کد: ${res9.status} - آدرس ذخیره‌شده: ${uploadedRelUrl}`
     );
   } catch (err: any) {
     recordTest(9, 'ذخیره‌سازی تصویر مجاز', 'V12.2', 'L1', false, err.message);
@@ -699,6 +720,329 @@ async function runSecurityTestSuite() {
     );
   } catch (err: any) {
     recordTest(18, 'پایش وضعیت امنیتی سامانه', 'V7.3', 'L2', false, err.message);
+  }
+
+  // --------------------------------------------------------------------------
+  // سناریو ۱۹ (A2): Fail-Fast در صورت تنظیم ZARINPAL_MODE=production در محیط غیر Production و بررسی app.cjs
+  // --------------------------------------------------------------------------
+  try {
+    const appCjsText = fs.readFileSync(path.resolve('app.cjs'), 'utf8');
+    const hasProdDefaultInAppCjs = appCjsText.includes('process.env.NODE_ENV') && appCjsText.includes("'production'");
+
+    const mismatchCheck = validateProductionEnvironment({
+      NODE_ENV: 'development',
+      ZARINPAL_MODE: 'production'
+    } as NodeJS.ProcessEnv);
+
+    const testModeMismatch = validateProductionEnvironment({
+      NODE_ENV: 'test',
+      ZARINPAL_MODE: 'production'
+    } as NodeJS.ProcessEnv);
+
+    const passed19 = hasProdDefaultInAppCjs && mismatchCheck.ok === false && testModeMismatch.ok === false;
+    recordTest(
+      19,
+      'Fail-Fast هم‌ترازی ZARINPAL_MODE=production با NODE_ENV=production و تنظیم app.cjs (A2)',
+      'V14.1',
+      'L1',
+      passed19,
+      `appCjs=${hasProdDefaultInAppCjs}, devMismatchBlocked=${!mismatchCheck.ok}, testMismatchBlocked=${!testModeMismatch.ok}`
+    );
+  } catch (err: any) {
+    recordTest(19, 'تطابق ZARINPAL_MODE و NODE_ENV (A2)', 'V14.1', 'L1', false, err.message);
+  }
+
+  // --------------------------------------------------------------------------
+  // سناریو ۲۰ (A3): الزام HTTPS APP_BASE_URL یا ZARINPAL_CALLBACK_URL در Production و عدم اتکا به Host header
+  // --------------------------------------------------------------------------
+  try {
+    const missingUrlProd = validateProductionEnvironment({
+      NODE_ENV: 'production',
+      ZARINPAL_MODE: 'production',
+      ADMIN_PASSWORD: 'StrongAdminPassword!2026',
+      SESSION_SECRET: 'a'.repeat(40)
+    } as NodeJS.ProcessEnv);
+
+    const httpUrlProd = validateProductionEnvironment({
+      NODE_ENV: 'production',
+      ZARINPAL_MODE: 'production',
+      ADMIN_PASSWORD: 'StrongAdminPassword!2026',
+      SESSION_SECRET: 'a'.repeat(40),
+      APP_BASE_URL: 'http://moricoland.ir'
+    } as NodeJS.ProcessEnv);
+
+    const validHttpsProd = validateProductionEnvironment({
+      NODE_ENV: 'production',
+      ZARINPAL_MODE: 'production',
+      ADMIN_PASSWORD: 'StrongAdminPassword!2026',
+      SESSION_SECRET: 'a'.repeat(40),
+      APP_BASE_URL: 'https://moricoland.ir/'
+    } as NodeJS.ProcessEnv);
+
+    const prevBase = process.env.APP_BASE_URL;
+    process.env.APP_BASE_URL = 'https://moricoland.ir/';
+    const resolvedCb = getCallbackUrl();
+    if (prevBase === undefined) delete process.env.APP_BASE_URL;
+    else process.env.APP_BASE_URL = prevBase;
+
+    const passed20 =
+      missingUrlProd.ok === false &&
+      httpUrlProd.ok === false &&
+      validHttpsProd.ok === true &&
+      resolvedCb === 'https://moricoland.ir/api/payments/zarinpal/callback';
+
+    recordTest(
+      20,
+      'الزام آدرس بازگشت HTTPS ثابت در Production بدون اتکا به هدر Host (A3)',
+      'V14.1 / V13.2',
+      'L1',
+      passed20,
+      `missingBlocked=${!missingUrlProd.ok}, httpBlocked=${!httpUrlProd.ok}, httpsAllowed=${validHttpsProd.ok}, cb=${resolvedCb}`
+    );
+  } catch (err: any) {
+    recordTest(20, 'اعتبارسنجی آدرس Callback در Production (A3)', 'V14.1', 'L1', false, err.message);
+  }
+
+  // --------------------------------------------------------------------------
+  // سناریو ۲۱ (B1): پیکربندی مسیرهای ذخیره‌سازی با DATA_DIR / UPLOADS_DIR و وجود اسکریپت بکاپ
+  // --------------------------------------------------------------------------
+  try {
+    const backupScriptExists = fs.existsSync(path.resolve('scripts/backup-data.sh'));
+    const storageSrc = fs.readFileSync(path.resolve('src/server/storage.ts'), 'utf8');
+    const usesEnvVars =
+      storageSrc.includes('process.env.DATA_DIR') &&
+      storageSrc.includes('process.env.UPLOADS_DIR') &&
+      fs.existsSync(DATA_DIR) &&
+      fs.existsSync(UPLOADS_DIR) &&
+      fs.existsSync(DESIGN_UPLOADS_DIR);
+
+    const passed21 = backupScriptExists && usesEnvVars;
+    recordTest(
+      21,
+      'پشتیبانی محیطی از DATA_DIR و UPLOADS_DIR و وجود اسکریپت بکاپ روزانه (B1)',
+      'V14.1',
+      'L1',
+      passed21,
+      `envDirs=${usesEnvVars}, backupScript=${backupScriptExists}`
+    );
+  } catch (err: any) {
+    recordTest(21, 'پشتیبانی محیطی از مسیرهای داده (B1)', 'V14.1', 'L1', false, err.message);
+  }
+
+  // --------------------------------------------------------------------------
+  // سناریو ۲۲ (B2): عدم پذیرش phone برای دسترسی به رسید پرداخت + rate limit مسیر result + سلامت track
+  // --------------------------------------------------------------------------
+  try {
+    const b2Order = {
+      id: `ord-b2-sec-${Date.now()}`,
+      orderNumber: `MC-B2${Date.now().toString().slice(-5)}`,
+      customerName: 'مشتری تست B2',
+      customerPhone: '09123334499',
+      customerAddress: 'تهران، سعادت‌آباد',
+      items: [{ productId: testProduct.id, quantity: 1 }],
+      total: 395000,
+      totalAmount: 395000,
+      status: 'PENDING_PAYMENT' as const,
+      trackingCode: 'TRK-B2TEST'
+    };
+    dbOrders.push(b2Order);
+
+    const resQueryPhone = await request(app)
+      .get(`/api/payments/orders/${b2Order.orderNumber}/result?phone=09123334499`)
+      .set('X-Forwarded-For', '198.51.100.41');
+    const resVerifyPhoneOnly = await request(app)
+      .post('/api/payments/zarinpal/verify')
+      .set('X-Forwarded-For', '198.51.100.41')
+      .send({ orderNumber: b2Order.orderNumber, authority: 'S00000000000000000000000000000000000', phone: '09123334499' });
+    const resTrackStillOk = await request(app)
+      .post('/api/orders/track')
+      .set('X-Forwarded-For', '198.51.100.42')
+      .send({ orderNumber: b2Order.orderNumber, phone: '09123334499' });
+
+    const passed22 =
+      resQueryPhone.status === 401 &&
+      resQueryPhone.body?.trackingRequired === true &&
+      (resVerifyPhoneOnly.status === 400 || resVerifyPhoneOnly.status === 403) &&
+      resTrackStillOk.status === 200;
+
+    recordTest(
+      22,
+      'حذف احراز هویت صرفاً با شماره تلفن از مسیرهای پرداخت و سلامت /orders/track (B2)',
+      'V4.1 / V4.2',
+      'L2',
+      passed22,
+      `resultStatus=${resQueryPhone.status}, trackStatus=${resTrackStillOk.status}`
+    );
+  } catch (err: any) {
+    recordTest(22, 'حذف fallback شماره تلفن (B2)', 'V4.1', 'L2', false, err.message);
+  }
+
+  // --------------------------------------------------------------------------
+  // سناریو ۲۳ (B3): اعمال محدودیت نرخ اختصاصی ثبت سفارش (۱۰ سفارش در ۱۰ دقیقه برای هر IP)
+  // --------------------------------------------------------------------------
+  try {
+    const floodIp = '198.51.100.77';
+    let hitOrderRateLimit = false;
+    for (let i = 0; i < 12; i++) {
+      const r = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', floodIp)
+        .send({ customerName: 'تست', customerPhone: 'invalid' });
+      if (r.status === 429) {
+        hitOrderRateLimit = true;
+        break;
+      }
+    }
+
+    recordTest(
+      23,
+      'محدودیت نرخ اختصاصی ثبت سفارش روی POST /api/orders (B3)',
+      'V13.1',
+      'L2',
+      hitOrderRateLimit,
+      hitOrderRateLimit ? 'درخواست یازدهم ثبت سفارش از یک IP با کد ۴۲۹ مسدود شد.' : 'محدودیت نرخ فعال نشد.'
+    );
+  } catch (err: any) {
+    recordTest(23, 'محدودیت نرخ اختصاصی ثبت سفارش (B3)', 'V13.1', 'L2', false, err.message);
+  }
+
+  // --------------------------------------------------------------------------
+  // سناریو ۲۴ (B5): محافظ Mass Assignment در محصولات/دسته‌ها/تخفیف‌ها و حفظ تنوع‌ها (variants) + لاگ تغییرات
+  // --------------------------------------------------------------------------
+  try {
+    // 1. Direct sanitizer unit check: partial update preserves omitted variants; full update keeps variants & published status
+    const partialSan = sanitizeProductInput({ price: 420000, stock: 7, isAdmin: true }, false);
+    const fullSan = sanitizeProductInput(
+      {
+        name: 'محصول تنوع‌دار تستی',
+        price: 550000,
+        stock: 15,
+        status: 'published',
+        customizable: true,
+        customizationFee: 180000,
+        variants: [
+          { id: 'v1', title: 'مشکی / M', price: 550000, stock: 5, attributes: { color: 'مشکی' } },
+          { id: 'v2', title: 'سفید / L', price: 590000, stock: 10, attributes: { color: 'سفید' } }
+        ],
+        __proto__Injected: 'bad',
+        role: 'admin'
+      },
+      true
+    );
+
+    const createProdRes = await request(app)
+      .post('/api/products')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({
+        id: 'HIJACKED_ID',
+        name: 'تی‌شرت تنوع‌دار B5',
+        price: 600000,
+        stock: 8,
+        status: 'published',
+        variants: [{ id: 'v-b5-1', title: 'مشکی / L', price: 600000, stock: 8, attributes: { color: 'مشکی' } }],
+        isAdmin: true
+      });
+    const createdId = createProdRes.body?.id;
+
+    // Inline partial edit (like AdminProducts inline price/stock save) MUST NOT wipe variants!
+    const inlinePutRes = await request(app)
+      .put(`/api/products/${createdId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ price: 650000, stock: 4, hackedField: 'evil' });
+
+    const discCreateRes = await request(app)
+      .post('/api/discounts')
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ code: 'B5SEC', percent: 15, usedCount: 999 });
+    const discId = discCreateRes.body?.id;
+    const discUpdateRes = await request(app)
+      .put(`/api/discounts/${discId}`)
+      .set('Authorization', `Bearer ${adminToken}`)
+      .send({ percent: 20, usedCount: 500, id: 'FORGED_DISC' });
+
+    const hasDiffAuditLog = getRecentAuditLogs().some(
+      (l) => l.event === 'CATALOG_MUTATION' && l.severity === 'warning' && l.details.includes('600000 -> 650000')
+    );
+
+    const passed24 =
+      !('error' in partialSan) &&
+      !('variants' in partialSan) &&
+      !('isAdmin' in partialSan) &&
+      !('error' in fullSan) &&
+      Array.isArray(fullSan.variants) &&
+      fullSan.variants.length === 2 &&
+      fullSan.status === 'published' &&
+      createProdRes.status === 201 &&
+      createdId !== 'HIJACKED_ID' &&
+      createProdRes.body?.isAdmin === undefined &&
+      inlinePutRes.status === 200 &&
+      inlinePutRes.body?.price === 650000 &&
+      Array.isArray(inlinePutRes.body?.variants) &&
+      inlinePutRes.body.variants.length === 1 &&
+      inlinePutRes.body?.hackedField === undefined &&
+      discCreateRes.status === 201 &&
+      discUpdateRes.status === 200 &&
+      discUpdateRes.body?.usedCount === 0 &&
+      discUpdateRes.body?.id === discId &&
+      hasDiffAuditLog;
+
+    // Clean up test items
+    if (createdId) {
+      const pi = dbProducts.findIndex((p) => p.id === createdId);
+      if (pi !== -1) dbProducts.splice(pi, 1);
+    }
+    if (discId) {
+      const di = dbDiscounts.findIndex((d) => d.id === discId);
+      if (di !== -1) dbDiscounts.splice(di, 1);
+    }
+
+    recordTest(
+      24,
+      'دفاع Mass Assignment در محصولات/تخفیف‌ها، حفظ variants در ویرایش و لاگ تغییرات قیمت/موجودی (B5)',
+      'V5.1 / V13.2',
+      'L2',
+      passed24,
+      `variantsPreserved=${inlinePutRes.body?.variants?.length === 1}, discUsed=${discUpdateRes.body?.usedCount}, auditDiff=${hasDiffAuditLog}`
+    );
+  } catch (err: any) {
+    recordTest(24, 'دفاع Mass Assignment کاتالوگ و تخفیف (B5)', 'V5.1', 'L2', false, err.message);
+  }
+
+  // --------------------------------------------------------------------------
+  // سناریو ۲۵ (C5): مسیر سلامت سرویس GET /api/health بدون افشای اسرار
+  // --------------------------------------------------------------------------
+  try {
+    const healthRes = await request(app).get('/api/health');
+    const healthStr = JSON.stringify(healthRes.body || {});
+    const leaksSecrets =
+      healthStr.includes('merchantId') ||
+      healthStr.includes('secret') ||
+      healthStr.includes('password') ||
+      healthStr.includes(SESSION_SECRET);
+
+    const passed25 =
+      healthRes.status === 200 &&
+      healthRes.body?.ok === true &&
+      typeof healthRes.body?.uptime === 'number' &&
+      !leaksSecrets;
+
+    recordTest(
+      25,
+      'مسیر پایش سلامت GET /api/health بدون افشای اطلاعات محرمانه (C5)',
+      'V13.2 / V7.3',
+      'L1',
+      passed25,
+      `status=${healthRes.status}, ok=${healthRes.body?.ok}, leaks=${leaksSecrets}`
+    );
+  } catch (err: any) {
+    recordTest(25, 'مسیر پایش سلامت GET /api/health (C5)', 'V13.2', 'L1', false, err.message);
+  }
+  } finally {
+    if (hadDataFile && originalDataSnapshot !== null) {
+      fs.writeFileSync(DATA_FILE, originalDataSnapshot, 'utf8');
+    } else if (!hadDataFile && fs.existsSync(DATA_FILE)) {
+      fs.unlinkSync(DATA_FILE);
+    }
   }
 
   // --------------------------------------------------------------------------

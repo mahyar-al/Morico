@@ -1,3 +1,5 @@
+import { normalizeIranianMobile, normalizeAndValidateEmail } from './security';
+
 export type ZarinPalMode = 'sandbox' | 'production';
 
 export interface ZarinPalRequestInput {
@@ -262,8 +264,10 @@ export async function requestZarinPalPayment(
   }
 
   const metadata: Record<string, string> = {};
-  if (input.mobile) metadata.mobile = String(input.mobile).trim();
-  if (input.email) metadata.email = String(input.email).trim();
+  const validMobile = input.mobile ? normalizeIranianMobile(input.mobile) : null;
+  if (validMobile) metadata.mobile = validMobile;
+  const emailCheck = input.email ? normalizeAndValidateEmail(input.email) : { valid: true, value: undefined };
+  if (emailCheck.valid && emailCheck.value) metadata.email = emailCheck.value;
   if (input.orderId) metadata.order_id = String(input.orderId).trim();
 
   const payload: Record<string, any> = {
@@ -395,24 +399,39 @@ export async function verifyZarinPalTransaction(
     input.timeoutMs ?? DEFAULT_ZARINPAL_TIMEOUT_MS
   );
 
-  // Network/Timeout/5xx non-JSON errors must be treated as AMBIGUOUS so orders are not wrongly discarded or marked PAID
-  if (httpRes.networkError || (!httpRes.ok && httpRes.status >= 500 && !httpRes.json)) {
+  // Network/Timeout, HTTP 429, or HTTP 5xx (with or without JSON) must be treated as AMBIGUOUS (A8)
+  if (httpRes.networkError || httpRes.status === 429 || httpRes.status >= 500) {
+    const rawErrObj = Array.isArray(httpRes.json?.errors) ? httpRes.json?.errors[0] : httpRes.json?.errors;
+    const transientCode = Number(rawErrObj?.code ?? httpRes.json?.data?.code ?? (httpRes.timeout ? -504 : httpRes.status === 429 ? -429 : -500));
     return {
       success: false,
-      code: httpRes.timeout ? -504 : -500,
+      code: Number.isFinite(transientCode) ? transientCode : -500,
       ambiguous: true,
-      networkError: true,
+      networkError: Boolean(httpRes.networkError),
       timeout: httpRes.timeout,
       message:
         httpRes.errorMessage ||
-        'ارتباط با سرور زرین‌پال برای تایید تراکنش برقرار نشد. وضعیت تراکنش در حالت بررسی مجدد (Pending Verify) قرار گرفت.'
+        'ارتباط با سرور زرین‌پال برای تایید تراکنش با خطای موقت مواجه شد. وضعیت تراکنش در حالت بررسی مجدد (Pending Verify) قرار گرفت.'
     };
   }
 
   const body = httpRes.json || {};
   const data = body.data;
   const errObj = Array.isArray(body.errors) ? body.errors[0] : body.errors;
-  const code = Number(data?.code ?? errObj?.code ?? -52);
+  const rawCode = data?.code ?? errObj?.code;
+  const hasExplicitCode = rawCode !== undefined && rawCode !== null && rawCode !== '' && Number.isFinite(Number(rawCode));
+
+  // Missing code in verify response is ambiguous — never prematurely fail an uncertain payment
+  if (!hasExplicitCode) {
+    return {
+      success: false,
+      code: -52,
+      ambiguous: true,
+      message: 'پاسخ تایید درگاه زرین‌پال فاقد کد وضعیت مشخص بود و برای پیشگیری از خطا در صف بررسی قرار گرفت.'
+    };
+  }
+
+  const code = Number(rawCode);
 
   if (httpRes.ok && data && (code === 100 || code === 101)) {
     const refIdRaw = data.ref_id ?? data.refId;
@@ -440,9 +459,19 @@ export async function verifyZarinPalTransaction(
     };
   }
 
+  // Official ZarinPal v4 definite verification failure codes (safe to mark FAILED):
+  // -50 (amount mismatch), -51 (unsuccessful/cancelled), -53 (wrong merchant), -54 (invalid authority),
+  // -55 (manual payment request not found), and validation/terminal config errors (-9..-11,-14..-16,-30,-40,-41).
+  // Transient/unexpected codes (-12 rate limit, -52 unexpected gateway error, or unknown codes) stay ambiguous.
+  const DEFINITE_VERIFY_FAILURE_CODES = new Set([
+    -9, -10, -11, -14, -15, -16, -30, -40, -41, -50, -51, -53, -54, -55
+  ]);
+  const isAmbiguous = !DEFINITE_VERIFY_FAILURE_CODES.has(code);
+
   return {
     success: false,
     code,
+    ...(isAmbiguous ? { ambiguous: true } : {}),
     message: mapZarinPalErrorCode(code, errObj?.message || data?.message)
   };
 }

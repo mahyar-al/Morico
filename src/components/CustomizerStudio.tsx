@@ -166,7 +166,12 @@ export const CustomizerStudio: React.FC<CustomizerStudioProps> = ({
     );
   };
 
-  const customFee = 150000;
+  const customFee =
+    typeof selectedProduct?.customizationFee === 'number' &&
+    Number.isFinite(selectedProduct.customizationFee) &&
+    selectedProduct.customizationFee >= 0
+      ? Math.round(selectedProduct.customizationFee)
+      : 150000;
   const effectiveProductPrice = (selectedProduct?.discountPrice || selectedProduct?.price) || 0;
   const totalPrice = effectiveProductPrice + customFee;
 

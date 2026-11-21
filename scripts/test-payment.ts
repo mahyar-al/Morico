@@ -7,6 +7,7 @@
 process.env.NODE_ENV = 'test';
 
 import fs from 'fs';
+import path from 'path';
 import request from 'supertest';
 import {
   app,
@@ -14,15 +15,25 @@ import {
   dbOrders,
   dbUsers,
   dbDiscounts,
+  runPaymentReconciler,
   signJoseToken,
   SESSION_SECRET
 } from '../server';
-import { DATA_FILE } from '../src/server/storage';
+import { DATA_FILE, DESIGN_UPLOADS_DIR, getRecentAuditLogs } from '../src/server/storage';
 import {
   setZarinPalTestTransport,
   tomanToRial,
+  verifyZarinPalTransaction,
   type ZarinPalTransportRequest
 } from '../src/server/payment';
+
+let orderIpCounter = 1;
+function nextOrderIp(): string {
+  const third = Math.floor(orderIpCounter / 200) + 1;
+  const fourth = (orderIpCounter % 200) + 1;
+  orderIpCounter++;
+  return `10.22.${third}.${fourth}`;
+}
 
 interface PaymentTestResult {
   id: number;
@@ -127,6 +138,7 @@ async function runPaymentTestSuite() {
       const statusRes = await request(app).get('/api/payments/status');
       const blockedGatewayRes = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری درگاه غیرفعال',
           customerPhone: '09121112233',
@@ -141,6 +153,7 @@ async function runPaymentTestSuite() {
 
       const cardOrderRes = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری کارت به کارت',
           customerPhone: '09121112233',
@@ -197,6 +210,7 @@ async function runPaymentTestSuite() {
 
       const orderRes = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری تست ۲',
           customerPhone: '09122223344',
@@ -255,6 +269,7 @@ async function runPaymentTestSuite() {
 
       const orderRes = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری تست ۳',
           customerPhone: '09123334455',
@@ -452,6 +467,7 @@ async function runPaymentTestSuite() {
 
       const order5 = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری تست ۵',
           customerPhone: '09125556677',
@@ -520,6 +536,7 @@ async function runPaymentTestSuite() {
 
       const order6 = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری تست ۶',
           customerPhone: '09126667788',
@@ -588,6 +605,7 @@ async function runPaymentTestSuite() {
 
       const order9 = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری تست ۹',
           customerPhone: '09129990011',
@@ -633,11 +651,12 @@ async function runPaymentTestSuite() {
     }
 
     // ------------------------------------------------------------------------
-    // تست ۱۰: دستکاری مبلغ، تخفیف و ارسال (۱۵۰۰۰۰۰ threshold + customization)
+    // تست ۱۰: دستکاری مبلغ، تخفیف و ارسال (۱۵۰۰۰۰۰ threshold + server customFee)
     // ------------------------------------------------------------------------
     try {
       const tamperedRes = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری تست ۱۰',
           customerPhone: '09121010101',
@@ -650,15 +669,16 @@ async function runPaymentTestSuite() {
           items: [
             {
               productId: prodRegular.id,
-              quantity: 2, // 1,800,000 - 10% (180,000) = 1,620,000 (>= 1,500,000 -> shipping 0!)
-              customization: { customFee: 100000 } // +200,000 -> subtotal 2,000,000 -> -200,000 = 1,800,000
+              quantity: 2,
+              customization: { customFee: 100000 } // Client fee ignored -> server 150,000 -> unit 1,050,000 * 2 = 2,100,000
             }
           ],
-          total: 500000 // Tampered total instead of 1,800,000
+          total: 500000 // Tampered total instead of 1,890,000
         });
 
       const validCustomizedRes = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری تست ۱۰ معتبر',
           customerPhone: '09121010102',
@@ -672,26 +692,27 @@ async function runPaymentTestSuite() {
             {
               productId: prodRegular.id,
               quantity: 2,
-              customization: { customFee: 100000 }
+              customization: { customFee: 1 } // Client fee ignored -> 150,000 => subtotal 2,100,000 - 210,000 = 1,890,000
             }
           ],
-          total: 1800000
+          total: 1890000
         });
       if (validCustomizedRes.body?.id) createdOrderIds.push(validCustomizedRes.body.id);
 
       const passed10 =
         tamperedRes.status === 400 &&
         validCustomizedRes.status === 201 &&
-        validCustomizedRes.body?.subtotal === 2000000 &&
-        validCustomizedRes.body?.discount === 200000 &&
+        validCustomizedRes.body?.subtotal === 2100000 &&
+        validCustomizedRes.body?.discount === 210000 &&
         validCustomizedRes.body?.shipping === 0 &&
-        validCustomizedRes.body?.total === 1800000;
+        validCustomizedRes.body?.total === 1890000 &&
+        validCustomizedRes.body?.items?.[0]?.customFee === 150000;
 
       record(
         10,
-        'محاسبه سرور مبلغ/تخفیف/ارسال و رد دستکاری کلاینت',
+        'محاسبه سرور مبلغ/کارمزد/تخفیف/ارسال و رد دستکاری کلاینت',
         passed10,
-        `tamperedStatus=${tamperedRes.status}, validTotal=${validCustomizedRes.body?.total}, shipping=${validCustomizedRes.body?.shipping}`
+        `tamperedStatus=${tamperedRes.status}, validTotal=${validCustomizedRes.body?.total}, customFee=${validCustomizedRes.body?.items?.[0]?.customFee}`
       );
     } catch (e: any) {
       record(10, 'رد دستکاری مبلغ', false, e.message);
@@ -710,6 +731,7 @@ async function runPaymentTestSuite() {
 
       const orderA = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'کاربر الف',
           customerPhone: '09121110001',
@@ -723,6 +745,7 @@ async function runPaymentTestSuite() {
         });
       const orderB = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'کاربر ب',
           customerPhone: '09121110002',
@@ -795,6 +818,7 @@ async function runPaymentTestSuite() {
       const stockBefore12 = prodRegular.stock;
       const order12 = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری هم‌زمان',
           customerPhone: '09121212121',
@@ -873,6 +897,7 @@ async function runPaymentTestSuite() {
       const stockBefore13 = prodRegular.stock;
       const order13 = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری تایم‌اوت',
           customerPhone: '09121313131',
@@ -938,6 +963,7 @@ async function runPaymentTestSuite() {
     try {
       const zeroOrderRes = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری کالای ناموجود',
           customerPhone: '09121414141',
@@ -966,11 +992,12 @@ async function runPaymentTestSuite() {
     }
 
     // ------------------------------------------------------------------------
-    // تست ۱۵: سفارش لغوشده -> Callback موفق نباید سفارش CANCELLED را PAID کند
+    // تست ۱۵ (B4): سفارش لغوشده با پرداخت موفق در درگاه -> verify + CANCELLED + needsReview + بدون کسر موجودی
     // ------------------------------------------------------------------------
     try {
       const auth15 = 'S00000000000000000000000000000015151';
       let verifyCalled15 = false;
+      const stockBefore15 = prodRegular.stock;
       setZarinPalTestTransport(async (req) => {
         if (req.url.endsWith('/request.json')) {
           return { ok: true, status: 200, json: { data: { code: 100, authority: auth15 } } };
@@ -981,6 +1008,7 @@ async function runPaymentTestSuite() {
 
       const order15 = await request(app)
         .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
         .send({
           customerName: 'مشتری لغوشده',
           customerPhone: '09121515151',
@@ -999,7 +1027,7 @@ async function runPaymentTestSuite() {
         .set('X-Payment-Token', order15.body.paymentToken)
         .send({ orderNumber: order15.body.orderNumber });
 
-      // Admin cancels order
+      // Admin cancels order before bank callback
       const cancelRes = await request(app)
         .put(`/api/orders/${order15.body.id}/status`)
         .set('Authorization', `Bearer ${adminToken}`)
@@ -1014,18 +1042,827 @@ async function runPaymentTestSuite() {
         cancelRes.status === 200 &&
         cbCancelled.status === 302 &&
         cbCancelled.headers.location ===
-          `/?payment=failed&reason=order_cancelled&orderNumber=${order15.body.orderNumber}` &&
-        !verifyCalled15 &&
-        stored15?.status === 'CANCELLED';
+          `/?payment=failed&reason=paid_after_cancel&orderNumber=${order15.body.orderNumber}` &&
+        verifyCalled15 &&
+        stored15?.status === 'CANCELLED' &&
+        stored15?.paymentStatus === 'SUCCESS' &&
+        stored15?.paymentInfo?.refId === '999999' &&
+        stored15?.needsReview === true &&
+        stored15?.reviewReason === 'PAID_AFTER_CANCEL' &&
+        prodRegular.stock === stockBefore15;
 
       record(
         15,
-        'جلوگیری از Paid شدن سفارش لغوشده در Callback',
+        'سفارش لغوشده با پرداخت موفق بانکی -> تایید و ثبت paid_after_cancel با needsReview بدون کسر موجودی (B4)',
         passed15,
-        `cancelStatus=${cancelRes.status}, cbRedirect=${cbCancelled.headers.location}, orderStatus=${stored15?.status}`
+        `cancelStatus=${cancelRes.status}, verifyCalled=${verifyCalled15}, cbRedirect=${cbCancelled.headers.location}, orderStatus=${stored15?.status}, needsReview=${stored15?.needsReview}, reason=${stored15?.reviewReason}`
       );
     } catch (e: any) {
-      record(15, 'جلوگیری از Paid شدن سفارش لغوشده', false, e.message);
+      record(15, 'سفارش لغوشده با پرداخت موفق بانکی (B4)', false, e.message);
+    }
+
+    // ------------------------------------------------------------------------
+    // تست ۱۷ (A1): کارمزد طراحی اختصاصی سمت سرور، customizationFee محصول و رد محصول غیرقابل‌سفارشی‌سازی
+    // ------------------------------------------------------------------------
+    const prodCustomFeeOverride = {
+      id: 'prod-pay-test-custom-override',
+      name: 'هودی با کارمزد اختصاصی',
+      price: 1000000,
+      stock: 5,
+      status: 'published',
+      isCustomizable: true,
+      customizationFee: 220000
+    };
+    const prodNoCustom = {
+      id: 'prod-pay-test-no-custom',
+      name: 'اکسسوری بدون چاپ',
+      price: 300000,
+      stock: 5,
+      status: 'published',
+      customizable: false
+    };
+    dbProducts.push(prodCustomFeeOverride, prodNoCustom);
+    try {
+      const feeZeroAttempt = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'تست دستکاری کارمزد',
+          customerPhone: '09121717171',
+          customerAddress: 'تهران، سعادت‌آباد، پلاک ۱۷',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1, customization: { customFee: 0 } }],
+          total: 945000 // Attacker assumes customFee=0
+        });
+
+      const feeHighAttempt = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'تست کارمزد بالا',
+          customerPhone: '09121717172',
+          customerAddress: 'تهران، سعادت‌آباد، پلاک ۱۷',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1, customization: { customFee: 999999 } }],
+          total: 900000 + 999999
+        });
+
+      const nonCustomizableAttempt = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'تست محصول غیرچاپی',
+          customerPhone: '09121717173',
+          customerAddress: 'تهران، سعادت‌آباد، پلاک ۱۷',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodNoCustom.id, quantity: 1, customization: { customFee: 150000 } }]
+        });
+
+      const overrideProductRes = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'تست محصول با کارمزد اختصاصی',
+          customerPhone: '09121717174',
+          customerAddress: 'تهران، سعادت‌آباد، پلاک ۱۷',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodCustomFeeOverride.id, quantity: 1, customization: { customFee: 1 } }],
+          total: 1000000 + 220000 + 45000
+        });
+      if (overrideProductRes.body?.id) createdOrderIds.push(overrideProductRes.body.id);
+
+      const passed17 =
+        feeZeroAttempt.status === 400 &&
+        feeHighAttempt.status === 400 &&
+        nonCustomizableAttempt.status === 400 &&
+        overrideProductRes.status === 201 &&
+        overrideProductRes.body?.items?.[0]?.customFee === 220000 &&
+        overrideProductRes.body?.total === 1265000;
+
+      record(
+        17,
+        'کنترل قطعی کارمزد طراحی اختصاصی در سرور و رد محصول غیرقابل چاپ (A1)',
+        passed17,
+        `zero=${feeZeroAttempt.status}, high=${feeHighAttempt.status}, noCustom=${nonCustomizableAttempt.status}, overrideFee=${overrideProductRes.body?.items?.[0]?.customFee}`
+      );
+    } catch (e: any) {
+      record(17, 'کارمزد طراحی اختصاصی سرور (A1)', false, e.message);
+    } finally {
+      for (const pid of [prodCustomFeeOverride.id, prodNoCustom.id]) {
+        const i = dbProducts.findIndex((p) => p.id === pid);
+        if (i !== -1) dbProducts.splice(i, 1);
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // تست ۱۸ (A4): نرمال‌سازی موبایل و اعتبارسنجی ایمیل پیش از ذخیره و ارسال به زرین‌پال
+    // ------------------------------------------------------------------------
+    try {
+      let sentMeta18: any = null;
+      setZarinPalTestTransport(async (req) => {
+        if (req.url.endsWith('/request.json')) {
+          sentMeta18 = req.body?.metadata;
+          return { ok: true, status: 200, json: { data: { code: 100, authority: 'S00000000000000000000000000000018181' } } };
+        }
+        return { ok: true, status: 200, json: { data: { code: 100, ref_id: 181818 } } };
+      });
+
+      const invalidPhoneRes = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'کاربر موبایل نامعتبر',
+          customerPhone: '08123456789',
+          customerAddress: 'تهران، جردن، کوچه ۱۸',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1 }]
+        });
+
+      const normOrderRes = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'کاربر موبایل بین‌المللی و ایمیل نامعتبر',
+          customerPhone: '+۹۸۹۱۲۳۴۵۶۷۸۹',
+          customerEmail: 'not-a-valid-email@',
+          customerAddress: 'تهران، جردن، کوچه ۱۸',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      if (normOrderRes.body?.id) createdOrderIds.push(normOrderRes.body.id);
+
+      await request(app)
+        .post('/api/payments/zarinpal/request')
+        .set('X-Payment-Token', normOrderRes.body.paymentToken)
+        .send({ orderNumber: normOrderRes.body.orderNumber });
+
+      const passed18 =
+        invalidPhoneRes.status === 400 &&
+        normOrderRes.status === 201 &&
+        normOrderRes.body?.customerPhone === '09123456789' &&
+        normOrderRes.body?.customerEmail === undefined &&
+        sentMeta18?.mobile === '09123456789' &&
+        sentMeta18?.email === undefined;
+
+      record(
+        18,
+        'نرمال‌سازی موبایل و حذف ایمیل نامعتبر از سفارش و metadata زرین‌پال (A4)',
+        passed18,
+        `invalidPhone=${invalidPhoneRes.status}, normalized=${normOrderRes.body?.customerPhone}, metaEmail=${sentMeta18?.email}`
+      );
+    } catch (e: any) {
+      record(18, 'نرمال‌سازی موبایل و ایمیل (A4)', false, e.message);
+    }
+
+    // ------------------------------------------------------------------------
+    // تست ۱۹ (A5): تعارض موجودی پس از Verify (Oversell) -> needsReview=true + INSUFFICIENT_STOCK + لاگ critical
+    // ------------------------------------------------------------------------
+    const prodSingleStock = {
+      id: 'prod-pay-test-single-stock',
+      name: 'تیشرت تک‌عدد تستی Oversell',
+      price: 500000,
+      stock: 1,
+      status: 'published',
+      customizable: false
+    };
+    dbProducts.push(prodSingleStock);
+    try {
+      const auth19a = 'S00000000000000000000000000000019191';
+      const auth19b = 'S00000000000000000000000000000019192';
+      let reqIdx19 = 0;
+      setZarinPalTestTransport(async (req) => {
+        if (req.url.endsWith('/request.json')) {
+          reqIdx19++;
+          return { ok: true, status: 200, json: { data: { code: 100, authority: reqIdx19 === 1 ? auth19a : auth19b } } };
+        }
+        return { ok: true, status: 200, json: { data: { code: 100, ref_id: 190000 + reqIdx19 } } };
+      });
+
+      const order19a = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'خریدار اول تک‌عدد',
+          customerPhone: '09121919191',
+          customerAddress: 'تهران، ونک، پلاک ۱۹',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodSingleStock.id, quantity: 1 }],
+          total: 545000
+        });
+      const order19b = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'خریدار دوم هم‌زمان',
+          customerPhone: '09121919192',
+          customerAddress: 'تهران، ونک، پلاک ۲۰',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodSingleStock.id, quantity: 1 }],
+          total: 545000
+        });
+      createdOrderIds.push(order19a.body.id, order19b.body.id);
+
+      await request(app)
+        .post('/api/payments/zarinpal/request')
+        .set('X-Payment-Token', order19a.body.paymentToken)
+        .send({ orderNumber: order19a.body.orderNumber });
+      await request(app)
+        .post('/api/payments/zarinpal/request')
+        .set('X-Payment-Token', order19b.body.paymentToken)
+        .send({ orderNumber: order19b.body.orderNumber });
+
+      // Buyer A pays first (stock 1 -> 0)
+      await request(app).get(`/api/payments/zarinpal/callback?Authority=${encodeURIComponent(auth19a)}&Status=OK`);
+      // Buyer B also completed payment before stock hit 0
+      await request(app).get(`/api/payments/zarinpal/callback?Authority=${encodeURIComponent(auth19b)}&Status=OK`);
+
+      const stored19a = dbOrders.find((o) => o.id === order19a.body.id);
+      const stored19b = dbOrders.find((o) => o.id === order19b.body.id);
+      const hasCriticalOversellLog = getRecentAuditLogs().some(
+        (l) => l.severity === 'critical' && l.details.includes('INSUFFICIENT_STOCK') && l.details.includes(stored19b?.orderNumber)
+      );
+
+      const passed19 =
+        stored19a?.status === 'PAID' &&
+        !stored19a?.needsReview &&
+        stored19b?.status === 'PAID' &&
+        stored19b?.needsReview === true &&
+        stored19b?.reviewReason === 'INSUFFICIENT_STOCK' &&
+        prodSingleStock.stock === 0 &&
+        hasCriticalOversellLog;
+
+      record(
+        19,
+        'علامت‌گذاری سفارش در تعارض موجودی (INSUFFICIENT_STOCK) و ثبت لاگ بحرانی (A5)',
+        passed19,
+        `needsReview=${stored19b?.needsReview}, reason=${stored19b?.reviewReason}, criticalLog=${hasCriticalOversellLog}`
+      );
+    } catch (e: any) {
+      record(19, 'تعارض موجودی بعد از پرداخت (A5)', false, e.message);
+    } finally {
+      const idx = dbProducts.findIndex((p) => p.id === prodSingleStock.id);
+      if (idx !== -1) dbProducts.splice(idx, 1);
+    }
+
+    // ------------------------------------------------------------------------
+    // تست ۲۰ (A6): Reconciler پس‌زمینه برای تعیین تکلیف پرداخت رهاشده و لغو سفارش قدیمی
+    // ------------------------------------------------------------------------
+    try {
+      const auth20 = 'S00000000000000000000000000000020201';
+      setZarinPalTestTransport(async (req) => {
+        if (req.url.endsWith('/request.json')) {
+          return { ok: true, status: 200, json: { data: { code: 100, authority: auth20 } } };
+        }
+        return { ok: true, status: 200, json: { data: { code: 100, ref_id: 202020, card_pan: '6219-86**-****-2020' } } };
+      });
+
+      const order20PaidNoCb = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'مشتری قطع‌شده قبل از callback',
+          customerPhone: '09122020201',
+          customerAddress: 'تهران، نیاوران، پلاک ۲۰',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      const order20Abandoned = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'مشتری رهاکننده ۲۴ ساعته',
+          customerPhone: '09122020202',
+          customerAddress: 'تهران، نیاوران، پلاک ۲۱',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      createdOrderIds.push(order20PaidNoCb.body.id, order20Abandoned.body.id);
+
+      await request(app)
+        .post('/api/payments/zarinpal/request')
+        .set('X-Payment-Token', order20PaidNoCb.body.paymentToken)
+        .send({ orderNumber: order20PaidNoCb.body.orderNumber });
+
+      // Backdate attempt & order dates for deterministic reconciler execution
+      const ref20a = dbOrders.find((o) => o.id === order20PaidNoCb.body.id);
+      const ref20b = dbOrders.find((o) => o.id === order20Abandoned.body.id);
+      if (ref20a?.paymentAttempts?.[0]) {
+        ref20a.paymentAttempts[0].createdAt = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+      }
+      if (ref20b) {
+        ref20b.date = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+      }
+
+      const recSummary = await runPaymentReconciler();
+
+      const passed20 =
+        recSummary.verified >= 1 &&
+        recSummary.expiredCancelled >= 1 &&
+        ref20a?.status === 'PAID' &&
+        ref20a?.paymentInfo?.refId === '202020' &&
+        ref20b?.status === 'CANCELLED' &&
+        ref20b?.paymentStatus === 'EXPIRED';
+
+      record(
+        20,
+        'تطبیق‌دهنده پس‌زمینه (Verify تراکنش رهاشده + لغو سفارش بدون پرداخت ۲۴ ساعته) (A6)',
+        passed20,
+        `verified=${recSummary.verified}, cancelled=${recSummary.expiredCancelled}, statusA=${ref20a?.status}, statusB=${ref20b?.status}`
+      );
+    } catch (e: any) {
+      record(20, 'تطبیق‌دهنده پس‌زمینه (A6)', false, e.message);
+    }
+
+    // ------------------------------------------------------------------------
+    // تست ۲۱ (A7): مصرف کد تخفیف فقط در پرداخت موفق + بررسی انقضا/سقف و percent در validate
+    // ------------------------------------------------------------------------
+    const singleUsePromo = {
+      id: 'disc-a7-test',
+      code: 'LIMITED20',
+      type: 'percentage',
+      percent: 20, // Deliberately no `amount` field to verify validate alignment
+      active: true,
+      maxUses: 1,
+      usedCount: 0,
+      expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString()
+    };
+    const expiredPromo = {
+      id: 'disc-a7-expired',
+      code: 'EXPIRED50',
+      type: 'percentage',
+      percent: 50,
+      active: true,
+      expiresAt: new Date(Date.now() - 60 * 1000).toISOString()
+    };
+    dbDiscounts.push(singleUsePromo, expiredPromo);
+    try {
+      const auth21 = 'S00000000000000000000000000000021211';
+      setZarinPalTestTransport(async (req) => {
+        if (req.url.endsWith('/request.json')) {
+          return { ok: true, status: 200, json: { data: { code: 100, authority: auth21 } } };
+        }
+        return { ok: true, status: 200, json: { data: { code: 100, ref_id: 212121 } } };
+      });
+
+      const valPercentRes = await request(app)
+        .post('/api/discounts/validate')
+        .send({ code: 'LIMITED20', subtotal: 900000 });
+      const valExpiredRes = await request(app)
+        .post('/api/discounts/validate')
+        .send({ code: 'EXPIRED50', subtotal: 900000 });
+
+      // Create unpaid order with LIMITED20 -> usedCount MUST remain 0
+      const order21 = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'مشتری تخفیف یک‌بارمصرف',
+          customerPhone: '09122121211',
+          customerAddress: 'تهران، پاسداران، پلاک ۲۱',
+          paymentMethod: 'gateway',
+          promoCode: 'LIMITED20',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 900000 - 180000 + 45000 // 765,000
+        });
+      if (order21.body?.id) createdOrderIds.push(order21.body.id);
+
+      const usedBeforePay = singleUsePromo.usedCount;
+      const valBeforePay = await request(app)
+        .post('/api/discounts/validate')
+        .send({ code: 'LIMITED20', subtotal: 900000 });
+
+      await request(app)
+        .post('/api/payments/zarinpal/request')
+        .set('X-Payment-Token', order21.body.paymentToken)
+        .send({ orderNumber: order21.body.orderNumber });
+      await request(app).get(`/api/payments/zarinpal/callback?Authority=${encodeURIComponent(auth21)}&Status=OK`);
+
+      const usedAfterPay = singleUsePromo.usedCount;
+      const valAfterPay = await request(app)
+        .post('/api/discounts/validate')
+        .send({ code: 'LIMITED20', subtotal: 900000 });
+
+      const passed21 =
+        valPercentRes.body?.valid === true &&
+        valPercentRes.body?.discountAmount === 180000 &&
+        valExpiredRes.body?.valid === false &&
+        order21.status === 201 &&
+        usedBeforePay === 0 &&
+        valBeforePay.body?.valid === true &&
+        usedAfterPay === 1 &&
+        valAfterPay.body?.valid === false;
+
+      record(
+        21,
+        'مصرف سهمیه تخفیف فقط در پرداخت موفق و هم‌ترازی validate (انقضا/سقف/درصد) (A7)',
+        passed21,
+        `percentAmt=${valPercentRes.body?.discountAmount}, expired=${valExpiredRes.body?.valid}, before=${usedBeforePay}, after=${usedAfterPay}, afterVal=${valAfterPay.body?.valid}`
+      );
+    } catch (e: any) {
+      record(21, 'سهمیه کد تخفیف و validate (A7)', false, e.message);
+    } finally {
+      for (const id of [singleUsePromo.id, expiredPromo.id]) {
+        const i = dbDiscounts.findIndex((d) => d.id === id);
+        if (i !== -1) dbDiscounts.splice(i, 1);
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // تست ۲۲ (A8): دسته‌بندی خطاهای مبهم (429 / 5xx+JSON / -12 / -52) و جلوگیری از پرداخت دوبل قبل از Retry
+    // ------------------------------------------------------------------------
+    try {
+      const auth22 = 'S00000000000000000000000000000022221';
+      let verifyPhase22: '429' | '500_json' | 'code_neg12' | 'code_neg52' | 'missing_code' | 'success' = '429';
+      let reqCalls22 = 0;
+
+      setZarinPalTestTransport(async (req) => {
+        if (req.url.endsWith('/request.json')) {
+          reqCalls22++;
+          return { ok: true, status: 200, json: { data: { code: 100, authority: auth22 } } };
+        }
+        if (verifyPhase22 === '429') return { ok: false, status: 429, json: { message: 'Too Many Requests' } };
+        if (verifyPhase22 === '500_json') return { ok: false, status: 500, json: { errors: { code: -52, message: 'Server error' } } };
+        if (verifyPhase22 === 'code_neg12') return { ok: false, status: 400, json: { errors: { code: -12 } } };
+        if (verifyPhase22 === 'code_neg52') return { ok: false, status: 400, json: { errors: { code: -52 } } };
+        if (verifyPhase22 === 'missing_code') return { ok: true, status: 200, json: { data: {} } };
+        return { ok: true, status: 200, json: { data: { code: 100, ref_id: 222222 } } };
+      });
+
+      const v429 = await verifyZarinPalTransaction({ authority: auth22, amountToman: 945000, merchantId: TEST_MERCHANT_UUID, mode: 'sandbox' });
+      verifyPhase22 = '500_json';
+      const v500Json = await verifyZarinPalTransaction({ authority: auth22, amountToman: 945000, merchantId: TEST_MERCHANT_UUID, mode: 'sandbox' });
+      verifyPhase22 = 'code_neg12';
+      const vNeg12 = await verifyZarinPalTransaction({ authority: auth22, amountToman: 945000, merchantId: TEST_MERCHANT_UUID, mode: 'sandbox' });
+      verifyPhase22 = 'code_neg52';
+      const vNeg52 = await verifyZarinPalTransaction({ authority: auth22, amountToman: 945000, merchantId: TEST_MERCHANT_UUID, mode: 'sandbox' });
+      verifyPhase22 = 'missing_code';
+      const vMissing = await verifyZarinPalTransaction({ authority: auth22, amountToman: 945000, merchantId: TEST_MERCHANT_UUID, mode: 'sandbox' });
+
+      // Test verify-before-retry when an order has an AMBIGUOUS attempt
+      const order22 = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'مشتری پیشگیری پرداخت دوبل',
+          customerPhone: '09122222221',
+          customerAddress: 'تهران، یوسف‌آباد، پلاک ۲۲',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      if (order22.body?.id) createdOrderIds.push(order22.body.id);
+
+      await request(app)
+        .post('/api/payments/zarinpal/request')
+        .set('X-Payment-Token', order22.body.paymentToken)
+        .send({ orderNumber: order22.body.orderNumber });
+
+      // Simulate callback receiving -52 (ambiguous)
+      verifyPhase22 = 'code_neg52';
+      await request(app).get(`/api/payments/zarinpal/callback?Authority=${encodeURIComponent(auth22)}&Status=OK`);
+
+      // User retries /request while bank actually succeeded -> server must verify AMBIGUOUS attempt first and block double pay with 409
+      verifyPhase22 = 'success';
+      const reqCallsBeforeRetry = reqCalls22;
+      const retryBlockedRes = await request(app)
+        .post('/api/payments/zarinpal/request')
+        .set('X-Payment-Token', order22.body.paymentToken)
+        .send({ orderNumber: order22.body.orderNumber });
+
+      const stored22 = dbOrders.find((o) => o.id === order22.body.id);
+
+      const passed22 =
+        v429.ambiguous === true &&
+        v500Json.ambiguous === true &&
+        vNeg12.ambiguous === true &&
+        vNeg52.ambiguous === true &&
+        vMissing.ambiguous === true &&
+        retryBlockedRes.status === 409 &&
+        retryBlockedRes.body?.alreadyPaid === true &&
+        reqCalls22 === reqCallsBeforeRetry &&
+        stored22?.status === 'PAID' &&
+        stored22?.paymentInfo?.refId === '222222';
+
+      record(
+        22,
+        'دسته‌بندی خطاهای مبهم verify و جلوگیری از پرداخت دوبل پیش از صدور Authority جدید (A8)',
+        passed22,
+        `ambiguous=[${v429.ambiguous},${v500Json.ambiguous},${vNeg12.ambiguous},${vNeg52.ambiguous},${vMissing.ambiguous}], retryStatus=${retryBlockedRes.status}, orderStatus=${stored22?.status}`
+      );
+    } catch (e: any) {
+      record(22, 'خطاهای مبهم و پیشگیری از پرداخت دوبل (A8)', false, e.message);
+    }
+
+    // ------------------------------------------------------------------------
+    // تست ۲۳ (B2): حذف کامل fallback موبایل از مسیرهای پرداخت و سلامت /orders/track
+    // ------------------------------------------------------------------------
+    try {
+      const order23 = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'مشتری تست توکن ۲۳',
+          customerPhone: '09122323231',
+          customerAddress: 'تهران، سعادت‌آباد، پلاک ۲۳',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      createdOrderIds.push(order23.body.id);
+
+      // Phone in query or body MUST NOT authorize payment endpoints
+      const resNoToken = await request(app).get(
+        `/api/payments/orders/${encodeURIComponent(order23.body.orderNumber)}/result?phone=09122323231`
+      );
+      const reqWithPhoneOnly = await request(app)
+        .post('/api/payments/zarinpal/request')
+        .send({ orderNumber: order23.body.orderNumber, phone: '09122323231' });
+      const resWithToken = await request(app)
+        .get(`/api/payments/orders/${encodeURIComponent(order23.body.orderNumber)}/result`)
+        .set('X-Payment-Token', order23.body.paymentToken);
+      const trackOk = await request(app)
+        .post('/api/orders/track')
+        .send({ orderNumber: order23.body.orderNumber, phone: '09122323231' });
+
+      const passed23 =
+        resNoToken.status === 401 &&
+        resNoToken.body?.trackingRequired === true &&
+        reqWithPhoneOnly.status === 403 &&
+        resWithToken.status === 200 &&
+        resWithToken.body?.order?.orderNumber === order23.body.orderNumber &&
+        trackOk.status === 200;
+
+      record(
+        23,
+        'حذف fallback شماره تماس از مسیرهای پرداخت و راهنمایی به پیگیری سفارش (B2)',
+        passed23,
+        `resultNoTok=${resNoToken.status}, reqPhoneOnly=${reqWithPhoneOnly.status}, resultTok=${resWithToken.status}, track=${trackOk.status}`
+      );
+    } catch (e: any) {
+      record(23, 'حذف fallback شماره تماس (B2)', false, e.message);
+    }
+
+    // ------------------------------------------------------------------------
+    // تست ۲۴ (B3 + A6): سقف ۳ سفارش PENDING_PAYMENT برای هر موبایل و لغو ۷۲ ساعته کارت‌به‌کارت + بازگشت تخفیف
+    // ------------------------------------------------------------------------
+    const cardPromo = {
+      id: 'disc-b3-card-promo',
+      code: 'CARDPROMO72',
+      type: 'percentage',
+      percent: 10,
+      active: true,
+      usedCount: 0,
+      maxUses: 5
+    };
+    dbDiscounts.push(cardPromo);
+    try {
+      const pendingPhone = '09122424241';
+      const p1 = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'سفارش اول',
+          customerPhone: pendingPhone,
+          customerAddress: 'تهران، ولیعصر، ۱',
+          paymentMethod: 'card',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      const p2 = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'سفارش دوم',
+          customerPhone: '+989122424241', // Normalized to same phone!
+          customerAddress: 'تهران، ولیعصر، ۲',
+          paymentMethod: 'card',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      const p3 = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'سفارش سوم',
+          customerPhone: pendingPhone,
+          customerAddress: 'تهران، ولیعصر، ۳',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      const p4Blocked = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'سفارش چهارم اضافه',
+          customerPhone: pendingPhone,
+          customerAddress: 'تهران، ولیعصر، ۴',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      [p1, p2, p3].forEach((r) => r.body?.id && createdOrderIds.push(r.body.id));
+
+      // Verify card order NOT cancelled at 25h, cancelled at 73h + promoCounted quota restored
+      const cardRef = dbOrders.find((o) => o.id === p1.body.id);
+      cardRef.promoCode = 'CARDPROMO72';
+      cardRef.promoCounted = true;
+      cardPromo.usedCount = 1;
+      cardRef.date = new Date(Date.now() - 25 * 60 * 60 * 1000).toISOString();
+      await runPaymentReconciler();
+      const statusAt25h = cardRef.status;
+
+      cardRef.date = new Date(Date.now() - 73 * 60 * 60 * 1000).toISOString();
+      await runPaymentReconciler();
+      const statusAt73h = cardRef.status;
+      const quotaAfter73h = cardPromo.usedCount;
+
+      const passed24 =
+        p1.status === 201 &&
+        p2.status === 201 &&
+        p3.status === 201 &&
+        p4Blocked.status === 429 &&
+        statusAt25h === 'PENDING_PAYMENT' &&
+        statusAt73h === 'CANCELLED' &&
+        quotaAfter73h === 0;
+
+      record(
+        24,
+        'سقف ۳ سفارش PENDING_PAYMENT و لغو ۷۲ ساعته کارت‌به‌کارت با بازگشت سهمیه تخفیف (B3)',
+        passed24,
+        `p4=${p4Blocked.status}, card25h=${statusAt25h}, card73h=${statusAt73h}, promoUsed=${quotaAfter73h}`
+      );
+    } catch (e: any) {
+      record(24, 'سقف ۳ سفارش PENDING و لغو ۷۲ ساعته (B3)', false, e.message);
+    } finally {
+      const di = dbDiscounts.findIndex((d) => d.id === cardPromo.id);
+      if (di !== -1) dbDiscounts.splice(di, 1);
+    }
+
+    // ------------------------------------------------------------------------
+    // تست ۲۵ (B3): ذخیره‌سازی تصاویر طراحی سفارشی به‌صورت فایل در UPLOADS_DIR/designs و مسدودیت SVG
+    // ------------------------------------------------------------------------
+    const createdDesignFiles: string[] = [];
+    try {
+      const tinyPngBase64 =
+        'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==';
+      const svgBase64 =
+        'data:image/png;base64,' + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>').toString('base64');
+
+      const svgOrderAttempt = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'مهاجم SVG طراحی',
+          customerPhone: '09122525251',
+          customerAddress: 'تهران، نیاوران، پلاک ۲۵',
+          paymentMethod: 'gateway',
+          items: [
+            {
+              productId: prodRegular.id,
+              quantity: 1,
+              customization: {
+                designImageUrl: svgBase64
+              }
+            }
+          ]
+        });
+
+      const designOrderRes = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'مشتری طراح اختصاصی',
+          customerPhone: '09122525252',
+          customerAddress: 'تهران، جردن، پلاک ۲۵',
+          paymentMethod: 'gateway',
+          items: [
+            {
+              productId: prodRegular.id,
+              quantity: 1,
+              customization: {
+                designImageUrl: tinyPngBase64,
+                previewMockupUrl: tinyPngBase64,
+                views: {
+                  front: {
+                    viewId: 'front',
+                    viewTitle: 'رو',
+                    layers: [{ id: 'l1', type: 'image', content: tinyPngBase64, x: 50, y: 50 }],
+                    designImageUrl: tinyPngBase64
+                  }
+                }
+              }
+            }
+          ],
+          total: 900000 + 150000 + 45000
+        });
+      if (designOrderRes.body?.id) createdOrderIds.push(designOrderRes.body.id);
+
+      const savedDesignUrl: string = designOrderRes.body?.items?.[0]?.customization?.designImageUrl || '';
+      const savedViewUrl: string =
+        designOrderRes.body?.items?.[0]?.customization?.views?.front?.designImageUrl || '';
+      const expectedFilename = path.basename(savedDesignUrl);
+      const diskPath = path.join(DESIGN_UPLOADS_DIR, expectedFilename);
+      if (savedDesignUrl.startsWith('/uploads/designs/') && fs.existsSync(diskPath)) {
+        createdDesignFiles.push(diskPath);
+      }
+
+      const passed25 =
+        svgOrderAttempt.status === 400 &&
+        designOrderRes.status === 201 &&
+        savedDesignUrl.startsWith('/uploads/designs/design_') &&
+        savedViewUrl === savedDesignUrl &&
+        !JSON.stringify(designOrderRes.body?.items?.[0]?.customization).includes('data:image/') &&
+        fs.existsSync(diskPath);
+
+      record(
+        25,
+        'ذخیره‌سازی فایل تصاویر طراحی سفارش در UPLOADS_DIR/designs و رد SVG (B3)',
+        passed25,
+        `svgBlocked=${svgOrderAttempt.status}, savedUrl=${savedDesignUrl}, exists=${fs.existsSync(diskPath)}`
+      );
+    } catch (e: any) {
+      record(25, 'ذخیره‌سازی فایل تصاویر طراحی (B3)', false, e.message);
+    } finally {
+      for (const f of createdDesignFiles) {
+        try {
+          if (fs.existsSync(f)) fs.unlinkSync(f);
+        } catch {}
+      }
+    }
+
+    // ------------------------------------------------------------------------
+    // تست ۲۶ (B6): الزام تایید و دلیل مشخص هنگام ارتقای دستی سفارش درگاهی فاقد RefID به PAID
+    // ------------------------------------------------------------------------
+    try {
+      const gwUnpaid = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'مشتری ارتقای دستی درگاهی',
+          customerPhone: '09122626261',
+          customerAddress: 'تهران، سعادت‌آباد، پلاک ۲۶',
+          paymentMethod: 'gateway',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      const cardUnpaid = await request(app)
+        .post('/api/orders')
+        .set('X-Forwarded-For', nextOrderIp())
+        .send({
+          customerName: 'مشتری کارت‌به‌کارت عادی',
+          customerPhone: '09122626262',
+          customerAddress: 'تهران، سعادت‌آباد، پلاک ۲۷',
+          paymentMethod: 'card',
+          items: [{ productId: prodRegular.id, quantity: 1 }],
+          total: 945000
+        });
+      createdOrderIds.push(gwUnpaid.body.id, cardUnpaid.body.id);
+
+      const unconfirmedAttempt = await request(app)
+        .put(`/api/orders/${gwUnpaid.body.id}/status`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'PAID' });
+
+      const confirmedAttempt = await request(app)
+        .put(`/api/orders/${gwUnpaid.body.id}/status`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({
+          status: 'PAID',
+          confirmManualPaid: true,
+          reason: 'رسید شاپرک در تیکت پشتیبانی تأیید شد'
+        });
+
+      const cardNormalAttempt = await request(app)
+        .put(`/api/orders/${cardUnpaid.body.id}/status`)
+        .set('Authorization', `Bearer ${adminToken}`)
+        .send({ status: 'PAID' });
+
+      const hasWarningAudit = getRecentAuditLogs().some(
+        (l) => l.severity === 'warning' && l.details.includes(gwUnpaid.body.orderNumber) && l.details.includes('بدون RefID')
+      );
+
+      const passed26 =
+        unconfirmedAttempt.status === 400 &&
+        unconfirmedAttempt.body?.requireManualConfirmation === true &&
+        confirmedAttempt.status === 200 &&
+        confirmedAttempt.body?.manuallyMarkedPaid === true &&
+        confirmedAttempt.body?.needsReview === true &&
+        typeof confirmedAttempt.body?.manualPaidReason === 'string' &&
+        cardNormalAttempt.status === 200 &&
+        hasWarningAudit;
+
+      record(
+        26,
+        'محافظ ارتقای دستی PAID بدون RefID برای درگاهی و سلامت کارت‌به‌کارت (B6)',
+        passed26,
+        `unconfirmed=${unconfirmedAttempt.status}, confirmed=${confirmedAttempt.status}, card=${cardNormalAttempt.status}, warnLog=${hasWarningAudit}`
+      );
+    } catch (e: any) {
+      record(26, 'محافظ ارتقای دستی PAID (B6)', false, e.message);
     }
   } finally {
     setZarinPalTestTransport(null);

@@ -111,7 +111,13 @@ export function calculateCartTotals(
     const qty = Math.max(1, item.quantity);
     totalItemsCount += qty;
 
-    const customFee = item.customization?.customFee || 0;
+    const customFee = item.customization
+      ? typeof liveProd.customizationFee === 'number' &&
+        Number.isFinite(liveProd.customizationFee) &&
+        liveProd.customizationFee >= 0
+        ? Math.round(liveProd.customizationFee)
+        : 150000
+      : 0;
     const baseOrig = item.selectedVariant ? item.selectedVariant.price : (item.unitPrice || liveProd.price);
     const baseEffective = item.selectedVariant 
       ? (item.selectedVariant.discountPrice !== undefined && item.selectedVariant.discountPrice < item.selectedVariant.price ? item.selectedVariant.discountPrice : item.selectedVariant.price)

@@ -180,11 +180,47 @@ export function cleanPhoneNumber(phone: unknown): string {
 }
 
 /**
- * Checks if a phone number matches Iranian mobile format (09xxxxxxxxx).
+ * Normalizes an Iranian mobile number (handles +98, 0098, 98, 9xxxxxxxxx, Persian/Arabic digits)
+ * to 11-digit 09xxxxxxxxx format. Returns null if invalid.
+ */
+export function normalizeIranianMobile(phone: unknown): string | null {
+  if (typeof phone !== 'string' && typeof phone !== 'number') return null;
+  const cleaned = cleanPhoneNumber(String(phone));
+  if (!cleaned) return null;
+
+  let normalized = cleaned;
+  if (normalized.startsWith('0098') && normalized.length === 14) {
+    normalized = `0${normalized.slice(4)}`;
+  } else if (normalized.startsWith('98') && normalized.length === 12) {
+    normalized = `0${normalized.slice(2)}`;
+  } else if (normalized.startsWith('9') && normalized.length === 10) {
+    normalized = `0${normalized}`;
+  }
+
+  return /^09\d{9}$/.test(normalized) ? normalized : null;
+}
+
+/**
+ * Checks if a phone number matches Iranian mobile format (09xxxxxxxxx or normalizable forms).
  */
 export function isValidIranianMobile(phone: string): boolean {
-  const cleaned = cleanPhoneNumber(phone);
-  return /^09\d{9}$/.test(cleaned);
+  return normalizeIranianMobile(phone) !== null;
+}
+
+const STANDARD_EMAIL_REGEX = /^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9-]+(?:\.[a-zA-Z0-9-]+)+$/;
+
+/**
+ * Validates and normalizes optional email addresses.
+ * Returns normalized lowercase email if valid, or undefined if empty/invalid.
+ */
+export function normalizeAndValidateEmail(email: unknown): { valid: boolean; value?: string } {
+  if (typeof email !== 'string') return { valid: true, value: undefined };
+  const trimmed = toEnglishDigits(email).replace(/[<>]/g, '').trim().toLowerCase();
+  if (!trimmed) return { valid: true, value: undefined };
+  if (trimmed.length > 120 || !STANDARD_EMAIL_REGEX.test(trimmed)) {
+    return { valid: false, value: undefined };
+  }
+  return { valid: true, value: trimmed };
 }
 
 /**

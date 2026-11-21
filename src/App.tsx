@@ -133,20 +133,18 @@ export default function App() {
     if (!orderNumberParam) return;
 
     let savedToken: string | undefined;
-    let savedPhone: string | undefined;
     try {
       const raw = sessionStorage.getItem('morico_pending_payment');
       if (raw) {
         const parsed = JSON.parse(raw);
         if (!parsed.orderNumber || parsed.orderNumber === orderNumberParam) {
           savedToken = parsed.paymentToken;
-          savedPhone = parsed.phone;
         }
       }
     } catch {}
 
     adminApi
-      .getPaymentResult(orderNumberParam, savedToken, savedPhone)
+      .getPaymentResult(orderNumberParam, savedToken)
       .then((res) => {
         const order = res?.order;
         if (order && (order.status === 'PAID' || order.status === 'PROCESSING' || order.status === 'SHIPPED' || order.status === 'DELIVERED')) {
@@ -178,6 +176,7 @@ export default function App() {
           orderNumber: orderNumberParam,
           reason: reasonParam,
           message: err?.message,
+          errorStatus: typeof err?.status === 'number' ? err.status : undefined,
           loading: false
         });
       });
@@ -298,13 +297,11 @@ export default function App() {
 
   const handleReverifyCallbackOrder = async (order: Order) => {
     let savedToken: string | undefined;
-    let savedPhone: string | undefined;
     try {
       const raw = sessionStorage.getItem('morico_pending_payment');
       if (raw) {
         const parsed = JSON.parse(raw);
         savedToken = parsed.paymentToken;
-        savedPhone = parsed.phone;
       }
     } catch {}
 
@@ -324,8 +321,7 @@ export default function App() {
         authority,
         orderNumber: order.orderNumber,
         orderId: order.id,
-        paymentToken: savedToken,
-        phone: savedPhone || order.customerPhone
+        paymentToken: savedToken
       });
       if (verifyRes.success && verifyRes.order) {
         store.addOrder(verifyRes.order);
@@ -344,20 +340,19 @@ export default function App() {
         type: err?.status === 503 ? 'pending_verify' : 'failed',
         orderNumber: order.orderNumber,
         order,
-        message: err?.message || 'بررسی مجدد تراکنش ناموفق بود.'
+        message: err?.message || 'بررسی مجدد تراکنش ناموفق بود.',
+        errorStatus: typeof err?.status === 'number' ? err.status : undefined
       });
     }
   };
 
   const handleRetryCallbackOrder = async (order: Order) => {
     let savedToken: string | undefined;
-    let savedPhone: string | undefined;
     try {
       const raw = sessionStorage.getItem('morico_pending_payment');
       if (raw) {
         const parsed = JSON.parse(raw);
         savedToken = parsed.paymentToken;
-        savedPhone = parsed.phone;
       }
     } catch {}
 
@@ -365,8 +360,7 @@ export default function App() {
       const reqRes = await adminApi.requestZarinPalPayment({
         orderNumber: order.orderNumber,
         orderId: order.id,
-        paymentToken: savedToken,
-        phone: savedPhone || order.customerPhone
+        paymentToken: savedToken
       });
       window.location.assign(reqRes.paymentUrl);
     } catch (err: any) {
@@ -374,7 +368,8 @@ export default function App() {
         type: 'failed',
         orderNumber: order.orderNumber,
         order,
-        message: err?.message || 'خطا در اتصال مجدد به درگاه زرین‌پال.'
+        message: err?.message || 'خطا در اتصال مجدد به درگاه زرین‌پال.',
+        errorStatus: typeof err?.status === 'number' ? err.status : undefined
       });
     }
   };
@@ -766,14 +761,14 @@ export default function App() {
         appliedCode={appliedPromoCode}
         currentUser={currentUser}
         onOrderSuccess={handleOrderSuccess}
+        onNavigateToTracking={() => {
+          setIsCheckoutOpen(false);
+          handleNavigate('track');
+        }}
         callbackResult={paymentCallbackResult}
         onClearCallbackResult={() => setPaymentCallbackResult(null)}
         onReverifyCallbackOrder={handleReverifyCallbackOrder}
         onRetryCallbackOrder={handleRetryCallbackOrder}
-        onNavigateToTracking={() => {
-          setActiveSection('track');
-          window.scrollTo({ top: 0, behavior: 'smooth' });
-        }}
       />
 
       {/* Auth Modal (Login & Registration) */}
